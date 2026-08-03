@@ -1,0 +1,12 @@
+FAIL: test_retry (pkg.conn_test.ConnTest.test_retry)
+Traceback (most recent call last):
+  [... 2 frames outside workspace ...]
+  File "/home/user/ws/pkg/conn_test.py", line 31, in test_retry
+    self.assertEqual(conn.retry(3), 0)
+  File "/home/user/ws/pkg/conn.py", line 88, in retry
+    return self._finish(rc)
+  [... 2 frames outside workspace ...]
+AssertionError: -1 != 0
+
+Ran 2 tests in 0.004s
+FAILED (failures=1)

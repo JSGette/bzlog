@@ -1,0 +1,35 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.6, pytest-7.4.3, pluggy-1.3.0
+rootdir: /home/user/ws
+collected 5 items
+
+pkg/conn_test.py ..F.F                                                   [100%]
+
+=================================== FAILURES ===================================
+_______________________________ test_timeout ___________________________________
+
+    def test_timeout():
+        conn = make_conn(retries=3)
+>       assert conn.retry() == 0
+E       assert -1 == 0
+E        +  where -1 = <bound method Conn.retry of <conn.Conn object at 0x7f>>()
+
+pkg/conn_test.py:14: AssertionError
+_______________________________ test_backoff ___________________________________
+
+    def test_backoff():
+        delays = list(backoff(3))
+>       assert delays == [1, 2, 4]
+E       assert [1, 2, 8] == [1, 2, 4]
+E         At index 2 diff: 8 != 4
+E         Use -v to get more diff
+
+pkg/conn_test.py:29: AssertionError
+----------------------------- Captured stdout call -----------------------------
+retrying in 1s
+retrying in 2s
+retrying in 8s
+=========================== short test summary info ============================
+FAILED pkg/conn_test.py::test_timeout - assert -1 == 0
+FAILED pkg/conn_test.py::test_backoff - assert [1, 2, 8] == [1, 2, 4]
+========================= 1 failed, 4 passed in 0.12s ==========================

@@ -1,0 +1,27 @@
+exec ${PAGER:-/usr/bin/less} "$0" || exit 1
+-----------------------------------------------------------------------------
+test_open (pkg.conn_test.ConnTest.test_open) ... ok
+test_retry (pkg.conn_test.ConnTest.test_retry) ... FAIL
+
+======================================================================
+FAIL: test_retry (pkg.conn_test.ConnTest.test_retry)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/unittest/case.py", line 57, in testPartExecutor
+    yield
+  File "/usr/lib/python3.11/unittest/case.py", line 623, in run
+    self._callTestMethod(testMethod)
+  File "/home/user/ws/pkg/conn_test.py", line 31, in test_retry
+    self.assertEqual(conn.retry(3), 0)
+  File "/home/user/ws/pkg/conn.py", line 88, in retry
+    return self._finish(rc)
+  File "/usr/lib/python3.11/unittest/case.py", line 873, in assertEqual
+    assertion_func(first, second, msg=msg)
+  File "/usr/lib/python3.11/unittest/case.py", line 866, in _baseAssertEqual
+    raise self.failureException(msg)
+AssertionError: -1 != 0
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.004s
+
+FAILED (failures=1)

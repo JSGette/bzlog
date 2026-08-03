@@ -53,6 +53,24 @@ Line-based tools emit N copies. bzlog fingerprints
 On the bundled fixture (47-way fan-out from a single bad header, one unrelated
 test failure, 900 successful actions): 192,298 B -> 2,079 B.
 
+## Framework-aware test log truncation
+
+A blind tail keeps the last 40 lines of a `test.log`, which is often teardown
+noise. bzlog first tries a registry of content-based detectors (the rule
+mnemonic lies on custom test wrappers):
+
+| framework | what is kept |
+|---|---|
+| gtest | `[ RUN ]`..`[ FAILED ]` block of each failing case + final summary |
+| go test | `--- FAIL:` blocks; for panics the message + first ~5 frames |
+| pytest | `FAILURES` section, each case cut at its assertion + short summary |
+| python traceback | frames outside the workspace collapsed to a marker |
+| JUnit | runs of framework stack frames (`org.junit`, `jdk.`, ...) collapsed |
+
+Unrecognized logs fall back to the tail. Extracted evidence carries
+`framework`, `kept_lines`, `total_lines`. Golden tests: `testdata/` +
+`python3 test_truncate.py` (`--update` to regenerate).
+
 ## Container shape
 
 - `invocation` — uuid, command, patterns, exit code, build metrics

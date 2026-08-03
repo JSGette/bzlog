@@ -1,0 +1,21 @@
+exec ${PAGER:-/usr/bin/less} "$0" || exit 1
+-----------------------------------------------------------------------------
+JUnit4 Test Runner
+..E.
+Time: 0.041
+There was 1 failure:
+1) timesOut(com.example.net.ConnTest)
+java.lang.AssertionError: expected:<0> but was:<-1>
+	at org.junit.Assert.fail(Assert.java:89)
+	at org.junit.Assert.failNotEquals(Assert.java:835)
+	at org.junit.Assert.assertEquals(Assert.java:647)
+	at com.example.net.ConnTest.timesOut(ConnTest.java:42)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:59)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at com.google.testing.junit.runner.junit4.JUnit4Runner.run(JUnit4Runner.java:116)
+	at com.google.testing.junit.runner.BazelTestRunner.main(BazelTestRunner.java:77)
+
+FAILURES!!!
+Tests run: 3,  Failures: 1

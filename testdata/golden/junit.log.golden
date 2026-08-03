@@ -1,0 +1,11 @@
+JUnit4 Test Runner
+Time: 0.041
+There was 1 failure:
+1) timesOut(com.example.net.ConnTest)
+java.lang.AssertionError: expected:<0> but was:<-1>
+	at [... 3 framework frames ...]
+	at com.example.net.ConnTest.timesOut(ConnTest.java:42)
+	at [... 6 framework frames ...]
+
+FAILURES!!!
+Tests run: 3,  Failures: 1

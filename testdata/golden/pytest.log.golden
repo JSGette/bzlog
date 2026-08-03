@@ -1,0 +1,24 @@
+=================================== FAILURES ===================================
+_______________________________ test_timeout ___________________________________
+
+    def test_timeout():
+        conn = make_conn(retries=3)
+>       assert conn.retry() == 0
+E       assert -1 == 0
+E        +  where -1 = <bound method Conn.retry of <conn.Conn object at 0x7f>>()
+pkg/conn_test.py:14: AssertionError
+
+_______________________________ test_backoff ___________________________________
+
+    def test_backoff():
+        delays = list(backoff(3))
+>       assert delays == [1, 2, 4]
+E       assert [1, 2, 8] == [1, 2, 4]
+E         At index 2 diff: 8 != 4
+E         Use -v to get more diff
+pkg/conn_test.py:29: AssertionError
+
+=========================== short test summary info ============================
+FAILED pkg/conn_test.py::test_timeout - assert -1 == 0
+FAILED pkg/conn_test.py::test_backoff - assert [1, 2, 8] == [1, 2, 4]
+========================= 1 failed, 4 passed in 0.12s ==========================

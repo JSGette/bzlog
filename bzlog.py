@@ -36,6 +36,11 @@ from urllib.parse import urlparse, unquote
 SCHEMA = "bzlog/v1"
 MAX_EVIDENCE_LINES = 40
 MAX_EVIDENCE_BYTES = 4096
+# Framework-extracted logs are already distilled, so they get a higher cap
+# than the blind tail: cutting a distilled log loses signal, cutting a raw
+# one loses noise.
+MAX_EXTRACTED_LINES = 160
+MAX_EXTRACTED_BYTES = 16384
 MAX_DIAGNOSTICS = 25
 
 
@@ -194,6 +199,318 @@ def parse_junit(xml_text: str, limit: int = 10) -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------
+# framework-aware test log truncation
+# --------------------------------------------------------------------------
+# A registry of (name, detector, extractor) pairs. Detection is content-based:
+# the rule mnemonic lies on custom test wrappers, the log itself does not.
+# Each extractor returns the distilled text or None; anything unrecognized
+# falls back to the blind tail() in Evidence.add.
+#
+# The main byte win is stack filtering: frames whose path lies outside the
+# workspace are collapsed to a one-line marker.
+
+# Paths that are framework internals regardless of where the workspace is.
+_FRAMEWORK_DIRS = re.compile(
+    r"(site-packages|dist-packages|/usr/lib/python|/importlib/|/unittest/|"
+    r"/_pytest/|/pluggy/)"
+)
+
+
+def _in_workspace(path: str, workspace: Optional[str]) -> bool:
+    p = path.replace("\\", "/")
+    if _FRAMEWORK_DIRS.search(p):
+        return False
+    if not (p.startswith("/") or re.match(r"^[A-Za-z]:", p)):
+        return True  # relative paths are workspace-relative in a sandbox
+    if workspace:
+        w = workspace.replace("\\", "/").rstrip("/") + "/"
+        return p.startswith(w)
+    return True  # absolute, workspace unknown: keep rather than guess
+
+
+# -- gtest -----------------------------------------------------------------
+
+_GTEST_RUN = re.compile(r"^\[ RUN      \] (\S+)")
+_GTEST_FAILED = re.compile(r"^\[  FAILED  \] (\S+)")
+_GTEST_OK = re.compile(r"^\[       OK \] ")
+_GTEST_SUMMARY = re.compile(r"^\[==========\] .*ran\.")
+
+
+def _detect_gtest(text: str) -> bool:
+    return "[ RUN      ]" in text
+
+
+def _extract_gtest(text: str, workspace: Optional[str]) -> Optional[str]:
+    """Block from [ RUN ] of a failing case to its [ FAILED ], plus the
+    trailing summary list."""
+    lines = text.splitlines()
+    out: list[str] = []
+    block: list[str] = []
+    in_block = False
+    summary_at = None
+    for i, ln in enumerate(lines):
+        if _GTEST_SUMMARY.match(ln):
+            summary_at = i
+        if _GTEST_RUN.match(ln):
+            block, in_block = [ln], True
+            continue
+        if in_block:
+            block.append(ln)
+            if _GTEST_FAILED.match(ln):
+                out.extend(block)
+                out.append("")
+                in_block = False
+            elif _GTEST_OK.match(ln):
+                in_block = False
+    if summary_at is not None:
+        out.extend(lines[summary_at:])
+    return "\n".join(out).strip("\n") if out else None
+
+
+# -- go test ---------------------------------------------------------------
+
+def _detect_go(text: str) -> bool:
+    return ("\n--- FAIL: " in text or text.startswith("--- FAIL: ")
+            or "\npanic: " in text or text.startswith("panic: "))
+
+
+def _extract_go(text: str, workspace: Optional[str]) -> Optional[str]:
+    """--- FAIL: block with its indented output; for panics the message and
+    the first ~5 frames; plus the trailing FAIL lines."""
+    lines = text.splitlines()
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        ln = lines[i]
+        if ln.startswith("--- FAIL: "):
+            out.append(ln)
+            i += 1
+            while i < n and lines[i].startswith((" ", "\t")):
+                out.append(lines[i])
+                i += 1
+            out.append("")
+            continue
+        if ln.startswith("panic: "):
+            out.append(ln)
+            i += 1
+            while i < n and not lines[i].startswith("goroutine "):
+                if lines[i].strip():
+                    out.append(lines[i])
+                i += 1
+            if i < n:
+                out.append(lines[i])  # goroutine header
+                i += 1
+                frames = 0
+                while i < n and frames < 5 and lines[i].strip():
+                    out.append(lines[i])
+                    if lines[i].startswith("\t"):
+                        frames += 1  # each frame is a func line + a \tfile:line
+                    i += 1
+            out.append("")
+            continue
+        if ln.startswith("FAIL"):
+            out.append(ln)
+        i += 1
+    return "\n".join(out).strip("\n") if out else None
+
+
+# -- pytest ----------------------------------------------------------------
+
+_PYTEST_FAILURES = re.compile(r"^=+ FAILURES =+$")
+_PYTEST_SECTION = re.compile(r"^=+ .* =+$")
+_PYTEST_CASE = re.compile(r"^_+ .+ _+$")
+_PYTEST_SUMMARY = re.compile(r"^=+ short test summary info =+$")
+_PYTEST_LOC = re.compile(r"^\S.*:\d+: \w+")
+
+
+def _detect_pytest(text: str) -> bool:
+    return any(_PYTEST_FAILURES.match(l) for l in text.splitlines())
+
+
+def _extract_pytest(text: str, workspace: Optional[str]) -> Optional[str]:
+    """The FAILURES section, each case cut at its first assertion block,
+    plus short test summary info."""
+    lines = text.splitlines()
+    start = next((i for i, ln in enumerate(lines) if _PYTEST_FAILURES.match(ln)), None)
+    if start is None:
+        return None
+    end = next((i for i in range(start + 1, len(lines))
+                if _PYTEST_SECTION.match(lines[i])), len(lines))
+    out = [lines[start]]
+    case: list[str] = []
+
+    def flush() -> None:
+        if not case:
+            return
+        out.append(case[0])
+        seen_assert = False
+        for k in range(1, len(case)):
+            ln = case[k]
+            if ln.startswith("E "):
+                seen_assert = True
+                out.append(ln)
+            elif seen_assert:
+                # assertion block over: keep the file:line marker, drop the rest
+                # (captured stdout/stderr is what bloats these logs)
+                loc = next((l for l in case[k:] if _PYTEST_LOC.match(l)), None)
+                if loc:
+                    out.append(loc)
+                break
+            else:
+                out.append(ln)
+        out.append("")
+
+    for i in range(start + 1, end):
+        if _PYTEST_CASE.match(lines[i]):
+            flush()
+            case = [lines[i]]
+        elif case:
+            case.append(lines[i])
+    flush()
+
+    si = next((i for i in range(end, len(lines)) if _PYTEST_SUMMARY.match(lines[i])), None)
+    if si is not None:
+        out.extend(lines[si:])
+    return "\n".join(out).strip("\n") if len(out) > 1 else None
+
+
+# -- python traceback (unittest et al.) ------------------------------------
+
+_PY_TB = "Traceback (most recent call last):"
+_PY_FRAME = re.compile(r'^\s+File "(?P<path>[^"]+)", line \d+')
+_PYTB_KEEP = re.compile(r"^(FAIL: |ERROR: |FAILED|OK\b|Ran \d+ tests?)")
+
+
+def _detect_pytb(text: str) -> bool:
+    return _PY_TB in text
+
+
+def _extract_pytb(text: str, workspace: Optional[str]) -> Optional[str]:
+    """Tracebacks with out-of-workspace frames collapsed, plus the FAIL/ERROR
+    headers and the runner's verdict lines."""
+    lines = text.splitlines()
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        ln = lines[i]
+        if _PY_TB in ln:
+            out.append(ln)
+            i += 1
+            dropped = 0
+            while i < n:
+                m = _PY_FRAME.match(lines[i])
+                if m:
+                    frame = [lines[i]]
+                    if i + 1 < n and lines[i + 1].startswith((" ", "\t")) \
+                            and not _PY_FRAME.match(lines[i + 1]):
+                        frame.append(lines[i + 1])
+                        i += 1
+                    i += 1
+                    if _in_workspace(m.group("path"), workspace):
+                        if dropped:
+                            out.append(f"  [... {dropped} frames outside workspace ...]")
+                            dropped = 0
+                        out.extend(frame)
+                    else:
+                        dropped += 1
+                    continue
+                if dropped:
+                    out.append(f"  [... {dropped} frames outside workspace ...]")
+                    dropped = 0
+                out.append(lines[i])
+                i += 1
+                if not lines[i - 1].startswith((" ", "\t")):
+                    break  # unindented line = the exception itself; traceback over
+            out.append("")
+            continue
+        if _PYTB_KEEP.match(ln):
+            out.append(ln)
+        i += 1
+    return "\n".join(out).strip("\n") if out else None
+
+
+# -- JUnit / java stack traces ---------------------------------------------
+
+_JAVA_FRAME = re.compile(r"^\s+at (?:app//|platform//)?(?P<cls>[\w.$/]+)\(")
+_JAVA_FRAMEWORK = re.compile(
+    r"^(org\.junit|junit\.|org\.testng|org\.hamcrest|jdk\.|java\.|javax\.|"
+    r"sun\.|com\.sun\.|org\.gradle|com\.google\.testing|org\.apache\.maven)"
+)
+_PROGRESS_DOTS = re.compile(r"^[.EF]+$")
+
+
+def _detect_junit(text: str) -> bool:
+    return ".java:" in text and re.search(r"^\s+at [\w.$/]+\(", text, re.M) is not None
+
+
+def _extract_junit(text: str, workspace: Optional[str]) -> Optional[str]:
+    """Keep the log but collapse runs of framework stack frames."""
+    out: list[str] = []
+    dropped = 0
+    changed = False
+
+    def flush() -> None:
+        nonlocal dropped
+        if dropped:
+            out.append(f"\tat [... {dropped} framework frames ...]")
+            dropped = 0
+
+    for ln in text.splitlines():
+        m = _JAVA_FRAME.match(ln)
+        if m:
+            cls = m.group("cls").split("/")[-1]  # strip java.base/ and app// prefixes
+            if _JAVA_FRAMEWORK.match(cls):
+                dropped += 1
+                changed = True
+                continue
+            flush()
+            out.append(ln)
+            continue
+        flush()
+        if ln.startswith("exec ${PAGER") or re.match(r"^-{40,}$", ln) \
+                or _PROGRESS_DOTS.match(ln.strip() or "x"):
+            changed = True
+            continue
+        out.append(ln)
+    flush()
+    if not changed:
+        return None
+    return "\n".join(out).strip("\n")
+
+
+# -- registry --------------------------------------------------------------
+
+_EXTRACTORS = [
+    ("gtest", _detect_gtest, _extract_gtest),
+    ("go", _detect_go, _extract_go),
+    ("pytest", _detect_pytest, _extract_pytest),
+    ("python", _detect_pytb, _extract_pytb),
+    ("junit", _detect_junit, _extract_junit),
+]
+
+
+def truncate_test_log(text: str, workspace: Optional[str] = None
+                      ) -> Optional[tuple[str, int, str]]:
+    """Distill a test.log with the first matching framework extractor.
+
+    Returns (kept_text, kept_lines, framework) or None when no framework
+    matched -- the caller then falls back to the plain tail.
+    """
+    if not text:
+        return None
+    for name, detect, extract in _EXTRACTORS:
+        try:
+            if not detect(text):
+                continue
+            kept = extract(text, workspace)
+        except Exception:
+            return None  # an extractor bug must never lose the log
+        if kept and kept.strip():
+            return kept, len(kept.splitlines()), name
+    return None
+
+
+# --------------------------------------------------------------------------
 # container assembly
 # --------------------------------------------------------------------------
 
@@ -202,16 +519,27 @@ class Evidence:
     store: dict[str, dict[str, Any]] = field(default_factory=dict)
     _by_hash: dict[str, str] = field(default_factory=dict)
 
-    def add(self, kind: str, text: str) -> Optional[str]:
+    def add(self, kind: str, text: str, framework: Optional[str] = None,
+            total_lines: Optional[int] = None) -> Optional[str]:
         if not text.strip():
             return None
-        body, truncated = tail(text)
+        if framework:
+            # already distilled by a framework extractor: generous cap only
+            body, truncated = tail(text, MAX_EXTRACTED_LINES, MAX_EXTRACTED_BYTES)
+        else:
+            body, truncated = tail(text)
         h = hashlib.sha256(body.encode()).hexdigest()[:12]
         if h in self._by_hash:
             return self._by_hash[h]
         ref = f"e{len(self.store) + 1}"
         self._by_hash[h] = ref
-        self.store[ref] = {"kind": kind, "truncated": truncated, "text": body}
+        entry: dict[str, Any] = {"kind": kind, "truncated": truncated, "text": body}
+        if framework:
+            entry["framework"] = framework
+            entry["kept_lines"] = len(body.splitlines())
+            if total_lines is not None:
+                entry["total_lines"] = total_lines
+        self.store[ref] = entry
         return ref
 
 
@@ -316,7 +644,13 @@ class Container:
             if "test.xml" in outputs:
                 cases = parse_junit(read_file_message(outputs["test.xml"], self.root))
             log_text = read_file_message(outputs.get("test.log", {}), self.root)
-            ref = self.ev.add("test.log", log_text)
+            extracted = truncate_test_log(log_text, self.root)
+            if extracted:
+                kept_text, _, framework = extracted
+                ref = self.ev.add("test.log", kept_text, framework=framework,
+                                  total_lines=len(log_text.splitlines()))
+            else:
+                ref = self.ev.add("test.log", log_text)
             diag = {
                 "kind": "test_failure",
                 "status": status,

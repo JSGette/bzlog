@@ -1,0 +1,18 @@
+exec ${PAGER:-/usr/bin/less} "$0" || exit 1
+-----------------------------------------------------------------------------
+=== RUN   TestParse
+--- FAIL: TestParse (0.00s)
+    parse_test.go:31: Parse("a,b") = 7, want 9
+=== RUN   TestParseEmpty
+--- PASS: TestParseEmpty (0.00s)
+=== RUN   TestRoundTrip
+--- FAIL: TestRoundTrip (0.02s)
+    --- FAIL: TestRoundTrip/unicode (0.01s)
+        roundtrip_test.go:88: mismatch after decode:
+            got:  "caf\x00"
+            want: "café"
+    --- PASS: TestRoundTrip/ascii (0.00s)
+=== RUN   TestVersion
+--- PASS: TestVersion (0.00s)
+FAIL
+FAIL	example.com/pkg/parse	0.031s

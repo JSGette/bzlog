@@ -1,0 +1,15 @@
+[ RUN      ] ConnTest.TimesOut
+net/conn/conn_test.cc:42: Failure
+Expected equality of these values:
+  rc
+    Which is: -1
+  0
+retry budget exhausted after 3 attempts
+[  FAILED  ] ConnTest.TimesOut (12 ms)
+
+[==========] 4 tests from 1 test suite ran. (13 ms total)
+[  PASSED  ] 3 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] ConnTest.TimesOut
+
+ 1 FAILED TEST
