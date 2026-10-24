@@ -23,6 +23,62 @@ environment, rc-file contents, executable version, and source revision still
 need to match; diagnostic-level `repro` commands are only suggestions and do
 not invent framework-specific test filters.
 
+## Test execution audit and rerun previews
+
+```sh
+python3 bzlog.py --audit-tests --record-command test //... > report.json
+python3 bzlog.py rerun report.json --format text
+```
+
+`--audit-tests` adds a full `test_audit` inventory, keyed by label and
+configuration. It works in wrapper and post-hoc modes. Each row separates the
+final test status from execution evidence: `executed`, `cached`, `mixed`,
+`not_run`, or `unknown`. Attempt counts deduplicate run/shard/attempt IDs and
+separate local and remote cache flags; a cache hit is counted once even when
+both flags are set. A passing result does not imply fresh execution.
+
+Execution is evidence about Bazel test attempts, not proof that every test case
+inside a runner executed. Noncached passed/failed/timed-out attempts establish
+execution; a remote infrastructure failure alone does not. Summary-only cache
+totals can establish full cache reuse, but summary-only noncache totals do not
+prove execution. Missing or contradictory counts are disclosed in `issues`.
+Known configured tests without results remain unknown unless an explicit
+build failure, skip, or pre-testing halt explains why they did not run.
+Tests filtered out before BEP emission cannot be enumerated by this audit.
+
+This inventory is opt-in and **not truncated by `--max-diagnostics`**: rerun
+selection must include failures beyond the compact diagnostic limit. The
+existing `summary.tests_*` counters retain their result/summary-based scope;
+the audit can additionally include configured tests with missing results.
+Its output and state therefore grow with the number of observed tests.
+
+`bzlog rerun` emits a preview only, as JSON by default (`bzlog/rerun-v1`). It
+selects final `FAILED`, `TIMEOUT`, `REMOTE_FAILURE`, and `FAILED_TO_BUILD`
+labels from the full audit. Flaky/recovered tests and unfinished attempts are
+excluded. A label with multiple configurations appears once in the command;
+all of its selected failure configurations remain listed in `failed_tests`.
+Other configurations of that label may also run. No testcase filter is invented.
+
+The planner requires a complete stream, wrapper-mode `--record-command`, and
+unambiguous Bazel original structured command metadata. It matches original
+option forms against recorded argument boundaries, preserving startup flags,
+configs, literal values, test filters, and cache policy. It rejects unknown or
+redacted option boundaries, ambiguous command tokens, target-pattern files,
+implicit/default targets, and commands other than `test`/`coverage`.
+
+Explicit BEP, profile, explain, and execution-log destination options are
+omitted from the preview so they do not directly reuse the original captures.
+Their names are listed in `omitted_capture_options`; rc files can still supply
+destinations. The preview does not pin environment, rc contents, executable,
+or sources, and does not promise fresh execution when cache reuse is enabled.
+It reports `nothing_to_rerun` when no confirmed final failures were observed;
+this is not a claim that every requested test ran successfully.
+
+See [the bviz comparison and implementation decisions](docs/AUDIT_RERUN_BVIZ.md)
+for scope, alternatives, and real WSL validation.
+
+## Command handling
+
 When wrapping Bazel, bzlog prints the result and exits with Bazel's exit code.
 If the Bazel process is terminated by a signal, bzlog exits with `128 + signal`.
 Post-hoc analysis of a BEP file exits 0 after producing a report, even when the

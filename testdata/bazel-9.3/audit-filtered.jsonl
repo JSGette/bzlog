@@ -1,0 +1,32 @@
+{"id":{"started":{}},"children":[{"progress":{}},{"unstructuredCommandLine":{}},{"structuredCommandLine":{"commandLineLabel":"original"}},{"structuredCommandLine":{"commandLineLabel":"canonical"}},{"structuredCommandLine":{"commandLineLabel":"tool"}},{"buildMetadata":{}},{"optionsParsed":{}},{"workspaceStatus":{}},{"pattern":{"pattern":["//src/test/cpp/util:md5_test","//src/test/cpp/util:numbers_test","//src/test/cpp/util:strings_test"]}},{"buildFinished":{}}]}
+{"id":{"buildMetadata":{}}}
+{"id":{"unstructuredCommandLine":{}}}
+{"id":{"optionsParsed":{}}}
+{"id":{"structuredCommandLine":{"commandLineLabel":"original"}}}
+{"id":{"structuredCommandLine":{"commandLineLabel":"tool"}}}
+{"id":{"pattern":{"pattern":["//src/test/cpp/util:md5_test","//src/test/cpp/util:numbers_test","//src/test/cpp/util:strings_test"]}},"children":[{"targetConfigured":{"label":"//src/test/cpp/util:md5_test"}},{"targetConfigured":{"label":"//src/test/cpp/util:numbers_test"}},{"targetConfigured":{"label":"//src/test/cpp/util:strings_test"}}]}
+{"id":{"progress":{}},"children":[{"progress":{"opaqueCount":1}},{"workspace":{}}]}
+{"id":{"workspace":{}}}
+{"id":{"structuredCommandLine":{"commandLineLabel":"canonical"}}}
+{"id":{"progress":{"opaqueCount":1}},"children":[{"progress":{"opaqueCount":2}},{"configuration":{"id":"b50797307a0362639d90bf6db8c02fdef043320eb64869787c6d768de84bfb3d"}}]}
+{"id":{"configuration":{"id":"b50797307a0362639d90bf6db8c02fdef043320eb64869787c6d768de84bfb3d"}}}
+{"id":{"workspaceStatus":{}}}
+{"id":{"targetConfigured":{"label":"//src/test/cpp/util:numbers_test"}},"children":[{"targetCompleted":{"label":"//src/test/cpp/util:numbers_test","configuration":{"id":"b50797307a0362639d90bf6db8c02fdef043320eb64869787c6d768de84bfb3d"}}}],"configured":{"targetKind":"cc_test rule","testSize":"MEDIUM"}}
+{"id":{"targetConfigured":{"label":"//src/test/cpp/util:md5_test"}},"children":[{"targetCompleted":{"label":"//src/test/cpp/util:md5_test","configuration":{"id":"b50797307a0362639d90bf6db8c02fdef043320eb64869787c6d768de84bfb3d"}}}],"configured":{"targetKind":"cc_test rule","testSize":"MEDIUM"}}
+{"id":{"targetConfigured":{"label":"//src/test/cpp/util:strings_test"}},"children":[{"targetCompleted":{"label":"//src/test/cpp/util:strings_test","configuration":{"id":"b50797307a0362639d90bf6db8c02fdef043320eb64869787c6d768de84bfb3d"}}}],"configured":{"targetKind":"cc_test rule","testSize":"MEDIUM"}}
+{"id":{"progress":{"opaqueCount":2}},"children":[{"progress":{"opaqueCount":3}},{"namedSet":{"id":"0"}}]}
+{"id":{"namedSet":{"id":"0"}}}
+{"id":{"targetCompleted":{"label":"//src/test/cpp/util:md5_test","configuration":{"id":"b50797307a0362639d90bf6db8c02fdef043320eb64869787c6d768de84bfb3d"}}},"completed":{"success":true,"outputGroup":[{"name":"default","fileSets":[{"id":"0"}]}],"tag":["medium","moderate","noflaky","nolocal"]}}
+{"id":{"progress":{"opaqueCount":3}},"children":[{"progress":{"opaqueCount":4}},{"namedSet":{"id":"1"}}]}
+{"id":{"namedSet":{"id":"1"}}}
+{"id":{"targetCompleted":{"label":"//src/test/cpp/util:numbers_test","configuration":{"id":"b50797307a0362639d90bf6db8c02fdef043320eb64869787c6d768de84bfb3d"}}},"completed":{"success":true,"outputGroup":[{"name":"default","fileSets":[{"id":"1"}]}],"tag":["medium","moderate","noflaky","nolocal"]}}
+{"id":{"progress":{"opaqueCount":4}},"children":[{"progress":{"opaqueCount":5}},{"namedSet":{"id":"2"}}]}
+{"id":{"namedSet":{"id":"2"}}}
+{"id":{"targetCompleted":{"label":"//src/test/cpp/util:strings_test","configuration":{"id":"b50797307a0362639d90bf6db8c02fdef043320eb64869787c6d768de84bfb3d"}}},"completed":{"success":true,"outputGroup":[{"name":"default","fileSets":[{"id":"2"}]}],"tag":["medium","moderate","noflaky","nolocal"]}}
+{"id":{"progress":{"opaqueCount":5}},"children":[{"progress":{"opaqueCount":6}},{"convenienceSymlinksIdentified":{}}]}
+{"id":{"convenienceSymlinksIdentified":{}}}
+{"id":{"buildFinished":{}},"children":[{"buildMetrics":{}}],"finished":{"finishTimeMillis":"1792875015188","exitCode":{"name":"NO_TESTS_FOUND","code":4},"finishTime":"2026-10-24T20:50:15.188Z"}}
+{"id":{"progress":{"opaqueCount":6}},"children":[{"progress":{"opaqueCount":7}},{"buildToolLogs":{}}]}
+{"id":{"buildToolLogs":{}}}
+{"id":{"progress":{"opaqueCount":7}}}
+{"id":{"buildMetrics":{}},"lastMessage":true}

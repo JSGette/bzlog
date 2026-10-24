@@ -608,7 +608,7 @@ class StreamStatus:
 
 
 class Container:
-    def __init__(self, root: Optional[str] = None):
+    def __init__(self, root: Optional[str] = None, audit_tests: bool = False):
         self.root = root
         self.ev = Evidence()
         self.invocation: dict[str, Any] = {}
@@ -623,6 +623,10 @@ class Container:
         self._progress_stderr = ""
         self.console_output = ""
         self._tests: dict[str, dict[str, Any]] = {}
+        self.audit_tests = audit_tests
+        self._audit_candidates: dict[str, dict[str, Any]] = {}
+        self._audit_completions: dict[str, bool] = {}
+        self._audit_aborts: dict[str, str] = {}
         self.stream = StreamStatus()
 
     def consume(self, ev: dict[str, Any]) -> None:
@@ -745,6 +749,81 @@ class Container:
                 counts["tests_incomplete"] += 1
         return counts
 
+    def _test_audit(self) -> dict[str, Any]:
+        """Account for observed configured tests without treating a pass as execution."""
+        rows = []
+        counts = dict.fromkeys(("executed", "cached", "mixed", "not_run", "unknown"), 0)
+        tests = {**self._audit_candidates, **self._tests}
+        for key, test in sorted(tests.items()):
+            summary = test.get("summary", test.get("target_summary"))
+            status = summary.get("overallStatus", "NO_STATUS") if summary is not None else "UNKNOWN"
+            source = ("test_summary" if "summary" in test else
+                      "target_summary" if summary is not None else "unavailable")
+            results = list(test.get("results", {}).values())
+            attempts = {"observed": len(results), "executed": 0, "cached": 0,
+                        "cached_locally": 0, "cached_remotely": 0, "unknown": 0}
+            for result in results:
+                local, remote = result["cached_locally"], result["cached_remotely"]
+                attempts["cached_locally"] += bool(local)
+                attempts["cached_remotely"] += bool(remote)
+                if local or remote:
+                    attempts["cached"] += 1
+                elif result["status"] in {"PASSED", "FAILED", "TIMEOUT", "FLAKY"}:
+                    attempts["executed"] += 1
+                else:
+                    attempts["unknown"] += 1
+            reason = self._audit_aborts.get(key)
+            if summary is None and not results:
+                if reason in {"SKIPPED", "NO_BUILD", "NO_ANALYZE"}:
+                    status, source = reason, "aborted"
+                elif self._audit_completions.get(key) is False:
+                    status, source = "FAILED_TO_BUILD", "target_completed"
+            issues = []
+            totals = {}
+            if "summary" in test:
+                # Defaults apply inside an existing TestSummary message only.
+                try:
+                    total = int(summary.get("totalRunCount", 0))
+                    cached = int(summary.get("totalNumCached", 0))
+                except (ValueError, TypeError, OverflowError):
+                    total = cached = None
+                totals = {"attempts": total, "cached": cached}
+                if total is None or total < 0 or not 0 <= cached <= total:
+                    issues.append("invalid_summary_counts")
+                if total != len(results):
+                    issues.append("attempt_count_mismatch")
+                if len(results) == total and cached != attempts["cached"]:
+                    issues.append("cache_count_mismatch")
+            execution = "unknown"
+            if results and not attempts["unknown"] and not issues:
+                execution = ("mixed" if attempts["executed"] and attempts["cached"] else
+                             "cached" if attempts["cached"] else "executed")
+            elif not results:
+                if ("invalid_summary_counts" not in issues and totals.get("attempts", 0) > 0
+                        and totals["cached"] == totals["attempts"]):
+                    execution = "cached"
+                elif status in {"FAILED_TO_BUILD", "TOOL_HALTED_BEFORE_TESTING",
+                                "SKIPPED", "NO_BUILD", "NO_ANALYZE"} and not issues:
+                    execution = "not_run"
+            counts[execution] += 1
+            row = {"label": test["label"], "configuration": test["configuration"],
+                   "status": status, "final": source != "unavailable", "status_source": source,
+                   "execution": execution, "attempts": attempts}
+            if totals:
+                row["summary_counts"] = totals
+            if reason:
+                row["abort_reason"] = reason
+            if issues:
+                row["issues"] = issues
+            rows.append(row)
+        notices = []
+        if not rows:
+            notices.append("No tests are visible in this stream.")
+        elif not any(row["attempts"]["executed"] for row in rows):
+            notices.append("No fresh test execution observed; missing evidence does not prove nothing ran.")
+        return {"scope": "Tests identified in this BEP; tests filtered out before emission are unknown.",
+                "counts": {"total": len(rows), **counts}, "tests": rows, "notices": notices}
+
     # -- fingerprinting is what collapses the fan-out ----------------------
     @staticmethod
     def fingerprint(kind: str, action_type: str, errors: list[dict], evidence_ref) -> str:
@@ -786,6 +865,27 @@ class Container:
     # -- event handlers ---------------------------------------------------
     def handle(self, ev: dict[str, Any]) -> None:
         eid = ev.get("id", {})
+        if self.audit_tests:
+            if ev.get("configured", {}).get("testSize") in {"SMALL", "MEDIUM", "LARGE", "ENORMOUS"}:
+                for child in ev.get("children", []):
+                    tid = child.get("targetCompleted", {})
+                    if tid.get("label") and not tid.get("aspect"):
+                        identity = {"label": tid["label"], "configuration": tid.get("configuration")}
+                        self._audit_candidates[self.event_key(identity)] = identity
+            tid = eid.get("targetCompleted", {})
+            if tid.get("label") and not tid.get("aspect"):
+                key = self.event_key({"label": tid["label"], "configuration": tid.get("configuration")})
+                if "completed" in ev:
+                    self._audit_completions[key] = ev["completed"].get("success", False)
+                if "aborted" in ev:
+                    self._audit_aborts[key] = ev["aborted"].get("reason", "UNKNOWN")
+        if (ev.get("structuredCommandLine", {}).get("commandLineLabel") == "original"
+                and "replay" in self.invocation):
+            replay = self.invocation["replay"]
+            try:
+                replay["layout"] = command_layout(replay["argv"], ev["structuredCommandLine"])
+            except ValueError as exc:
+                replay["rerun_error"] = str(exc)
         if "pattern" in eid:
             self.invocation["patterns"] = eid["pattern"].get("pattern", [])
         if "progress" in ev:
@@ -1091,6 +1191,8 @@ class Container:
         }
         if omitted:
             out["summary"]["diagnostics_omitted"] = omitted
+        if self.audit_tests:
+            out["test_audit"] = self._test_audit()
         blob = json.dumps(out, separators=(",", ":"))
         out["stats"] = {
             "input_bytes": input_bytes,
@@ -1341,7 +1443,7 @@ BAZEL_VERBS = {
     "print_action", "query", "run", "shutdown", "sync", "test", "vendor", "version",
 }
 
-_OWN_BOOL = {"--pretty", "--progress", "--all-metrics", "--record-command"}
+_OWN_BOOL = {"--pretty", "--progress", "--all-metrics", "--record-command", "--audit-tests"}
 _OWN_VALUE = {"--root", "--fail-fast", "--max-diagnostics", "--format", "--evidence"}
 
 
@@ -1461,6 +1563,17 @@ def render_text(result: dict[str, Any]) -> str:
         out.extend("  " + line for line in inv["failure_context"].splitlines())
     if inv.get("replay"):
         out.append(f"replay argv (cwd {inv['replay']['cwd']}): {inv['replay']['command']}")
+    if "test_audit" in result:
+        audit = result["test_audit"]
+        out.append("test audit: " + ", ".join(f"{v} {k}" for k, v in audit["counts"].items()))
+        out.append("  " + audit["scope"])
+        out.extend("  " + notice for notice in audit["notices"])
+        for row in audit["tests"]:
+            config = (row.get("configuration") or {}).get("id", "unknown")
+            out.append(f"  {row['label']} [{config}]: {row['status']}, {row['execution']}"
+                       f"; observed attempts {row['attempts']['observed']}")
+            if row.get("issues"):
+                out.append("    " + ", ".join(row["issues"]))
 
     shown_evidence = set()
     for d in result.get("diagnostics", []):
@@ -1543,10 +1656,150 @@ def show_evidence(argv: list[str]) -> int:
     return 0
 
 
+# Remove explicitly recorded capture destinations from a narrowed preview. Rc
+# files may still supply destinations; the planner never runs the command.
+_CAPTURE_OPTIONS = {"build_event_json_file", "build_event_binary_file", "build_event_text_file",
+                    "profile", "explain", "execution_log_json_file", "execution_log_binary_file",
+                    "execution_log_compact_file"}
+
+
+def command_layout(argv: list[str], structured: dict[str, Any]) -> dict[str, Any]:
+    """Locate target tokens using Bazel's parsed original options, never shell splitting."""
+    sections = {s.get("sectionLabel"): s for s in structured.get("sections", [])}
+    command = sections.get("command", {}).get("chunkList", {}).get("chunk", [])
+    if len(command) != 1 or command[0] not in {"test", "coverage"}:
+        raise ValueError("Only recorded test/coverage commands can be narrowed.")
+    positions = [i for i, token in enumerate(argv) if token == command[0]]
+    if len(positions) != 1:
+        raise ValueError("The command boundary is ambiguous in the recorded argv.")
+    command_index = positions[0]
+    residual = sections.get("residual", {}).get("chunkList", {}).get("chunk", [])
+    if not residual:
+        raise ValueError("No explicit target patterns were recorded; target files/defaults are unsupported.")
+    options = sections.get("command options", {}).get("optionList", {}).get("option", [])
+    target_indices, output_indices, output_flags = [], [], set()
+    cursor, ri, separator = command_index + 1, 0, None
+    while cursor < len(argv):
+        token = argv[cursor]
+        if token == "--":
+            if argv[cursor + 1:] != residual[ri:]:
+                raise ValueError("The recorded target suffix does not match Bazel's residual arguments.")
+            separator = cursor
+            target_indices.extend(range(cursor + 1, len(argv)))
+            ri = len(residual)
+            break
+        matches = set()
+        for option in options:
+            form, name = option.get("combinedForm"), option.get("optionName")
+            if not name or not token.startswith("-"):
+                continue
+            if form == token:
+                matches.add((1, name))
+            if (cursor + 1 < len(argv) and option.get("optionValue") == argv[cursor + 1]
+                    and form == token + " " + argv[cursor + 1]):
+                matches.add((2, name))
+        is_target = ri < len(residual) and token == residual[ri]
+        if len(matches) + int(is_target) != 1:
+            raise ValueError("An argument is ambiguous or absent/redacted in Bazel's original command metadata.")
+        if is_target:
+            target_indices.append(cursor)
+            ri += 1
+            cursor += 1
+        else:
+            width, name = matches.pop()
+            if name == "target_pattern_file":
+                raise ValueError("Target-pattern files are unsupported for narrowed reruns.")
+            if name in _CAPTURE_OPTIONS:
+                output_indices.extend(range(cursor, cursor + width))
+                output_flags.add(name)
+            cursor += width
+    if ri != len(residual):
+        raise ValueError("Some target patterns could not be located in the original argv.")
+    return {"version": 1, "command_index": command_index, "target_indices": target_indices,
+            "output_indices": output_indices, "output_flags": sorted(output_flags),
+            "separator_index": separator}
+
+
+def rerun_plan(report: dict[str, Any]) -> dict[str, Any]:
+    """Preview a label-level rerun; this function does not execute anything."""
+    if report.get("schema") != SCHEMA:
+        raise ValueError("Unsupported report schema.")
+    inv = report.get("invocation", {})
+    if inv.get("stream", {}).get("status") != "complete":
+        raise ValueError("A complete BEP stream is required for a rerun plan.")
+    audit = report.get("test_audit")
+    if not isinstance(audit, dict) or not isinstance(audit.get("tests"), list):
+        raise ValueError("Capture a JSON report with --audit-tests first.")
+    failed = [row for row in audit["tests"] if row.get("final") is True
+              and row.get("status") in FAILED_TEST_STATUSES]
+    labels = sorted({row["label"] for row in failed})
+    if any(not isinstance(label, str) or not label.startswith(("//", "@")) for label in labels):
+        raise ValueError("Failed tests must have absolute Bazel labels.")
+    plan = {"schema": "bzlog/rerun-v1", "status": "preview" if labels else "nothing_to_rerun",
+            "targets": labels, "failed_tests": [{k: row[k] for k in
+                ("label", "configuration", "status")} for row in failed]}
+    if not labels:
+        return plan
+    replay = inv.get("replay", {})
+    if replay.get("rerun_error"):
+        raise ValueError(replay["rerun_error"])
+    layout, argv, cwd = replay.get("layout", {}), replay.get("argv"), replay.get("cwd")
+    if (layout.get("version") != 1 or not isinstance(argv, list)
+            or not all(isinstance(token, str) for token in argv) or not isinstance(cwd, str) or not cwd):
+        raise ValueError("Capture with --record-command; unambiguous original command metadata is required.")
+    ci = layout.get("command_index")
+    targets, outputs = layout.get("target_indices"), layout.get("output_indices")
+    separator = layout.get("separator_index")
+    if (type(ci) is not int or not 0 < ci < len(argv) or argv[ci] not in {"test", "coverage"}
+            or not isinstance(targets, list) or not targets or not isinstance(outputs, list)):
+        raise ValueError("Invalid recorded command layout.")
+    removed = targets + outputs + ([] if separator is None else [separator])
+    if (any(type(i) is not int or not ci < i < len(argv) for i in removed)
+            or len(set(removed)) != len(removed)
+            or separator is not None and argv[separator] != "--"):
+        raise ValueError("Invalid recorded argument indices.")
+    omitted = set(removed)
+    narrowed = [token for i, token in enumerate(argv) if i not in omitted] + ["--", *labels]
+    import shlex
+    plan.update({"argv": narrowed, "cwd": cwd, "command": shlex.join(narrowed),
+                 "omitted_capture_options": layout.get("output_flags", []),
+                 "scope": "Final failing labels only; their other configurations may also run. "
+                          "Original flags, including test filters and cache policy, are preserved. "
+                          "Environment, rc files, executable and sources are not pinned. "
+                          "Explicit capture destinations are omitted; rc files may still supply them. "
+                          "Preview only: no command was executed."})
+    return plan
+
+
+def show_rerun(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="bzlog rerun", description="Preview a rerun of final failing test labels.")
+    ap.add_argument("report", help="JSON report captured with --audit-tests --record-command")
+    ap.add_argument("--format", choices=["json", "text"], default="json")
+    args = ap.parse_args(argv)
+    try:
+        with open(args.report) as fh:
+            plan = rerun_plan(json.load(fh))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        print(f"bzlog rerun: cannot create plan: {exc}", file=sys.stderr)
+        return 2
+    if args.format == "text":
+        if plan["status"] == "nothing_to_rerun":
+            print("No confirmed final test failures to rerun.")
+        else:
+            print(f"Rerun preview (cwd {plan['cwd']}):\n{plan['command']}\n{plan['scope']}")
+            if plan["omitted_capture_options"]:
+                print("Omitted capture flags: " + ", ".join(plan["omitted_capture_options"]))
+    else:
+        print(json.dumps(plan, separators=(",", ":")))
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["show"]:
         return show_evidence(argv[1:])
+    if argv[:1] == ["rerun"]:
+        return show_rerun(argv[1:])
     own, rest = split_argv(argv)
 
     ap = argparse.ArgumentParser(
@@ -1570,6 +1823,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="always emit build metrics instead of only anomalies")
     ap.add_argument("--record-command", action="store_true",
                     help="include original Bazel argv and cwd for replay (may contain secrets)")
+    ap.add_argument("--audit-tests", action="store_true",
+                    help="include every observed configured test with execution/cache evidence")
     args = ap.parse_args(own)
     if args.max_diagnostics < 1:
         ap.error("--max-diagnostics must be at least 1")
@@ -1580,7 +1835,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not rest:
         ap.error("need a Bazel command (e.g. `bzlog test //...`) or a BEP file")
 
-    c = Container(root=args.root)
+    c = Container(root=args.root, audit_tests=args.audit_tests)
     exit_code = 0
 
     # A lone existing file means post-hoc analysis; anything else is a build.

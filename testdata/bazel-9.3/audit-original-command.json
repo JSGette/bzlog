@@ -1,0 +1,135 @@
+{
+  "structuredCommandLine": {
+    "commandLineLabel": "original",
+    "sections": [
+      {
+        "sectionLabel": "command",
+        "chunkList": {
+          "chunk": [
+            "test"
+          ]
+        }
+      },
+      {
+        "sectionLabel": "command options",
+        "optionList": {
+          "option": [
+            {
+              "combinedForm": "--startup_time=941",
+              "optionName": "startup_time",
+              "optionValue": "941"
+            },
+            {
+              "combinedForm": "--command_wait_time=0",
+              "optionName": "command_wait_time",
+              "optionValue": "0"
+            },
+            {
+              "combinedForm": "--restart_reason=no_daemon",
+              "optionName": "restart_reason",
+              "optionValue": "no_daemon"
+            },
+            {
+              "combinedForm": "--binary_path=/workspace/bazel/bazel",
+              "optionName": "binary_path",
+              "optionValue": "/workspace/bazel/bazel"
+            },
+            {
+              "combinedForm": "--test_env BZLOG_LITERAL=$(literal) a b",
+              "optionName": "test_env",
+              "optionValue": "BZLOG_LITERAL=$(literal) a b"
+            },
+            {
+              "combinedForm": "--keep_going",
+              "optionName": "keep_going",
+              "optionValue": "1"
+            },
+            {
+              "combinedForm": "--nocache_test_results",
+              "optionName": "cache_test_results",
+              "optionValue": "0"
+            },
+            {
+              "combinedForm": "--build_event_binary_file=/workspace/captures/failure.bep",
+              "optionName": "build_event_binary_file",
+              "optionValue": "/workspace/captures/failure.bep"
+            },
+            {
+              "combinedForm": "--profile=/workspace/captures/failure.profile.gz",
+              "optionName": "profile",
+              "optionValue": "/workspace/captures/failure.profile.gz"
+            },
+            {
+              "combinedForm": "--jobs=4",
+              "optionName": "jobs",
+              "optionValue": "4"
+            },
+            {
+              "combinedForm": "--local_resources=cpu=4",
+              "optionName": "local_resources",
+              "optionValue": "cpu=4"
+            },
+            {
+              "combinedForm": "--color=no",
+              "optionName": "color",
+              "optionValue": "no"
+            },
+            {
+              "combinedForm": "--curses=no",
+              "optionName": "curses",
+              "optionValue": "no"
+            },
+            {
+              "combinedForm": "--symlink_prefix=/",
+              "optionName": "symlink_prefix",
+              "optionValue": "/"
+            },
+            {
+              "combinedForm": "--build_event_json_file /workspace/captures/failure.bep.json",
+              "optionName": "build_event_json_file",
+              "optionValue": "/workspace/captures/failure.bep.json"
+            },
+            {
+              "combinedForm": "--build_event_json_file_path_conversion=false",
+              "optionName": "build_event_json_file_path_conversion",
+              "optionValue": "false"
+            }
+          ]
+        }
+      },
+      {
+        "sectionLabel": "residual",
+        "chunkList": {
+          "chunk": [
+            "//src/test/cpp/util:md5_test",
+            "//src/test/cpp/util:numbers_test",
+            "//src/test/cpp/util:strings_test"
+          ]
+        }
+      }
+    ]
+  },
+  "argv": [
+    "bazel",
+    "--output_base=/workspace/previous/fault-output-base",
+    "--host_jvm_args=-Xmx3g",
+    "test",
+    "//src/test/cpp/util:md5_test",
+    "--test_env",
+    "BZLOG_LITERAL=$(literal) a b",
+    "//src/test/cpp/util:numbers_test",
+    "//src/test/cpp/util:strings_test",
+    "--keep_going",
+    "--nocache_test_results",
+    "--build_event_binary_file=/workspace/captures/failure.bep",
+    "--profile=/workspace/captures/failure.profile.gz",
+    "--jobs=4",
+    "--local_resources=cpu=4",
+    "--color=no",
+    "--curses=no",
+    "--symlink_prefix=/",
+    "--build_event_json_file",
+    "/workspace/captures/failure.bep.json"
+  ],
+  "cwd": "/workspace/bazel"
+}

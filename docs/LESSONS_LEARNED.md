@@ -41,5 +41,20 @@ unchanged to the native WSL checkout and remains untracked.
     missed by handcrafted fixtures that explicitly wrote zero/false. Keep both
     narrow synthetic regressions and reduced, attributed real streams.
 
+13. **Passed does not mean freshly executed.** Keep final status, observed
+    attempts, cache provenance, and missing results separate. A configured
+    target can survive tag filtering while producing no test result; absence
+    alone does not establish the reason. Test-attempt evidence does not prove
+    individual test cases inside a custom runner executed.
+14. **A narrowed command needs argument boundaries.** An option value can look
+    exactly like a target pattern. Match Bazel's original parsed option forms
+    to recorded argv, reject ambiguity, and select failures from an untruncated
+    inventory. Quote only for display; never parse a command back with shell
+    splitting or execute a generated preview automatically.
+15. **Inspect overlap in source, not just feature lists.** bviz already handles
+    configured target outcomes, flaky tests, cache summaries, and causal edges.
+    bzlog's useful focus is compact headless evidence and explicit uncertainty;
+    graphical dependency and performance exploration can use bviz captures.
+
 The validation record documents alternatives, limitations, and the next work
 in order; it does not treat deferred features as implemented.
