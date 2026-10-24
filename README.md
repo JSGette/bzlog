@@ -6,7 +6,7 @@ Post-hoc:
 
 ```
 bazel test //... --build_event_json_file=bep.json
-python3 bzlog.py bep.json --pretty
+python3 bzlog.py --pretty bep.json
 ```
 
 Wrapping Bazel, consuming the stream live:
@@ -85,6 +85,38 @@ Unrecognized logs fall back to the tail. Extracted evidence carries
 
 Successful actions never appear. Evidence for dropped diagnostics is garbage
 collected before serialization.
+
+Analysis and loading failures retain their messages, including failures attached
+to target-pattern events. Empty analysis events are linked to descriptive root
+causes through BEP child IDs, regardless of event arrival order. Failures with
+unavailable logs are kept separate instead of being assumed identical; matching
+compiler diagnostics are grouped within the same configuration.
+
+When structured messages are missing, bzlog retains bounded BEP progress and
+Bazel console context. These logs are marked as invocation-wide evidence, not
+attributed to a particular target. Early errors and final output are both kept
+so a long list of skipped-target warnings does not hide the initial failure.
+
+## Inspecting evidence
+
+The default `--evidence ref` writes a unique, private temporary sidecar for each
+invocation and returns its path as `evidence_sidecar`. Text output includes a
+command you can run to read the referenced excerpt:
+
+```
+bzlog show /tmp/bzlog-evidence-EXAMPLE.json e1
+```
+
+Use the actual path and evidence ID from your report. Sidecars contain bounded
+excerpts, not full original logs, and remain available until removed or cleaned
+up by the system's temporary-file policy. Separate invocations do not overwrite
+each other's evidence. If saving fails, evidence stays inline in the report.
+
+`--evidence inline` includes excerpts in both JSON and text output;
+`--evidence none` omits evidence blobs and references. Diagnostic messages and
+brief invocation context remain visible in every mode.
+
+Regression checks: `python3 -m unittest discover` and `python3 test_truncate.py`.
 
 ## Not done yet
 

@@ -64,8 +64,12 @@ _JAVAC = re.compile(
 )
 # rustc:  error[E0433]: failed to resolve
 _RUSTC = re.compile(r"^(?P<severity>error|warning)(\[(?P<code>E\d+)\])?:\s*(?P<message>.+)$")
+_BAZEL = re.compile(
+    r"^ERROR:\s+(?P<file>[^:]+):(?P<line>\d+):(?:(?P<col>\d+):)?\s*(?P<message>.+)$"
+)
 
 _PARSERS = [
+    ("bazel", _BAZEL),
     ("gcc", _GCC),
     ("javac", _JAVAC),
     ("go", _GO),
@@ -97,7 +101,8 @@ def parse_diagnostics(text: str, limit: int = 12) -> list[dict[str, Any]]:
                 break  # keep only hard failures in the compact view
             d: dict[str, Any] = {"severity": sev, "message": g["message"].strip()}
             if g.get("file"):
-                d["file"] = g["file"].lstrip("./")
+                path = g["file"]
+                d["file"] = path[2:] if path.startswith("./") else path
             if g.get("line"):
                 d["line"] = int(g["line"])
             if g.get("col"):
@@ -171,6 +176,17 @@ def tail(text: str, lines: int = MAX_EVIDENCE_LINES, nbytes: int = MAX_EVIDENCE_
         kept = kept.encode()[-nbytes:].decode("utf-8", "replace")
         truncated = True
     return kept, truncated
+
+
+def bounded_log(text: str, nbytes: int = 65536) -> str:
+    """Bound invocation context while retaining both early errors and final output."""
+    raw = text.encode("utf-8")
+    if len(raw) <= nbytes:
+        return text
+    marker = b"\n[... invocation output omitted ...]\n"
+    half = (nbytes - len(marker)) // 2
+    return (raw[:half].decode("utf-8", "ignore") + marker.decode() +
+            raw[-half:].decode("utf-8", "ignore"))
 
 
 def parse_junit(xml_text: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -523,12 +539,21 @@ class Evidence:
             total_lines: Optional[int] = None) -> Optional[str]:
         if not text.strip():
             return None
-        if framework:
+        if kind == "invocation_log":
+            lines = [line for line in text.splitlines() if not _NOISE.match(line)]
+            if len(lines) > MAX_EVIDENCE_LINES:
+                lines = (lines[:MAX_EVIDENCE_LINES // 2] +
+                         ["[... invocation output omitted ...]"] +
+                         lines[-MAX_EVIDENCE_LINES // 2:])
+            body = bounded_log("\n".join(lines), MAX_EVIDENCE_BYTES)
+            truncated = body != text
+        elif framework:
             # already distilled by a framework extractor: generous cap only
             body, truncated = tail(text, MAX_EXTRACTED_LINES, MAX_EXTRACTED_BYTES)
         else:
             body, truncated = tail(text)
-        h = hashlib.sha256(body.encode()).hexdigest()[:12]
+        # Different logs can have identical tails. Never dedupe on the excerpt.
+        h = hashlib.sha256((kind + "\0" + text).encode()).hexdigest()
         if h in self._by_hash:
             return self._by_hash[h]
         ref = f"e{len(self.store) + 1}"
@@ -558,6 +583,43 @@ class Container:
         }
         self._diags: dict[str, dict[str, Any]] = {}  # fingerprint -> diagnostic
         self._order: list[str] = []
+        self._abort_events: dict[str, str] = {}
+        self._abort_children: dict[str, list[str]] = {}
+        self._progress_stderr = ""
+        self.console_output = ""
+
+    @staticmethod
+    def event_key(eid: dict[str, Any]) -> str:
+        return json.dumps(eid, sort_keys=True, separators=(",", ":"))
+
+    def _resolved_diagnostics(self) -> list[dict[str, Any]]:
+        """Link empty analysis parents to descriptive causes, in either event order."""
+        diags = {fp: dict(d, _targets=list(d["_targets"]))
+                 for fp, d in self._diags.items()}
+        dropped = set()
+        for event, fp in self._abort_events.items():
+            if diags[fp].get("description"):
+                continue
+            pending = list(self._abort_children.get(event, []))
+            visited = {event}
+            causes = set()
+            while pending:
+                child = pending.pop()
+                if child in visited:
+                    continue
+                visited.add(child)
+                child_fp = self._abort_events.get(child)
+                if child_fp and diags[child_fp].get("description"):
+                    causes.add(child_fp)
+                else:
+                    pending.extend(self._abort_children.get(child, []))
+            if causes:
+                dropped.add(fp)
+                for cause in causes:
+                    for target in diags[fp]["_targets"]:
+                        if target not in diags[cause]["_targets"]:
+                            diags[cause]["_targets"].append(target)
+        return [diags[fp] for fp in self._order if fp not in dropped]
 
     # -- fingerprinting is what collapses the fan-out ----------------------
     @staticmethod
@@ -570,22 +632,41 @@ class Container:
             key = f"{evidence_ref}"
         return hashlib.sha256(f"{kind}/{action_type}/{key}".encode()).hexdigest()[:12]
 
-    def add_diag(self, diag: dict[str, Any], target: Optional[str]) -> None:
-        fp = self.fingerprint(
-            diag["kind"], diag.get("action_type", ""), diag.get("errors", []), diag.get("evidence")
-        )
+    def add_diag(self, diag: dict[str, Any], target: Optional[str],
+                 event_id: Optional[dict[str, Any]] = None) -> str:
+        if diag.get("kind") in ("analysis_error", "aborted") or not (
+                diag.get("errors") or diag.get("evidence")):
+            # Aborts are joined through BEP edges. Missing evidence proves no
+            # equivalence, even if both failures have the same action mnemonic.
+            fp = ("event:" + self.event_key(event_id) if event_id
+                  else f"unknown:{len(self._order)}")
+        else:
+            fp = self.fingerprint(
+                diag["kind"], diag.get("action_type", ""),
+                diag.get("errors", []), diag.get("evidence")
+            ) + self.event_key({"configuration": diag.get("configuration"),
+                               "status": diag.get("status"),
+                               "failure_category": diag.get("failure_category"),
+                               "failure_code": diag.get("failure_code"),
+                               "cases": diag.get("cases")})
         existing = self._diags.get(fp)
         if existing:
             if target and target not in existing["_targets"]:
                 existing["_targets"].append(target)
-            return
+            return fp
         diag["_targets"] = [target] if target else []
         self._diags[fp] = diag
         self._order.append(fp)
+        return fp
 
     # -- event handlers ---------------------------------------------------
     def handle(self, ev: dict[str, Any]) -> None:
         eid = ev.get("id", {})
+        if "pattern" in eid:
+            self.invocation["patterns"] = eid["pattern"].get("pattern", [])
+        if "progress" in ev:
+            self._progress_stderr = bounded_log(
+                self._progress_stderr + ev["progress"].get("stderr", ""))
 
         if "started" in ev:
             s = ev["started"]
@@ -597,9 +678,6 @@ class Container:
             })
             if self.root is None:
                 self.root = s.get("workspaceDirectory")
-
-        elif "pattern" in eid:
-            self.invocation["patterns"] = eid["pattern"].get("pattern", [])
 
         elif "action" in ev:
             a = ev["action"]
@@ -617,18 +695,20 @@ class Container:
                 "action_type": atype,
                 "exit_code": a.get("exitCode"),
                 "errors": errors,
+                "configuration": eid.get("actionCompleted", {}).get("configuration"),
             }
             fd = a.get("failureDetail")
             if fd:
                 cat = next((k for k in fd if k != "message"), None)
                 diag["failure_category"] = cat
+                diag["failure_code"] = (fd.get(cat) or {}).get("code")
                 if fd.get("message"):
                     diag["failure_message"] = fd["message"][:300]
             if a.get("primaryOutput", {}).get("name"):
                 diag["primary_output"] = a["primaryOutput"]["name"]
             if ref:
                 diag["evidence"] = ref
-            self.add_diag(diag, label)
+            self.add_diag(diag, label, eid)
 
         elif "testResult" in ev:
             r = ev["testResult"]
@@ -658,6 +738,7 @@ class Container:
                 "shard": int(tid.get("shard", 0)),
                 "cases": cases,
                 "errors": [],
+                "configuration": tid.get("configuration"),
             }
             ei = r.get("executionInfo", {})
             if ei.get("exitCode") is not None:
@@ -666,7 +747,7 @@ class Container:
                 diag["strategy"] = ei["strategy"]
             if ref:
                 diag["evidence"] = ref
-            self.add_diag(diag, label)
+            self.add_diag(diag, label, eid)
 
         elif "testSummary" in ev:
             s = ev["testSummary"]
@@ -678,15 +759,25 @@ class Container:
 
         elif "aborted" in ev:
             a = ev["aborted"]
-            label = eid.get("targetCompleted", {}).get("label") or eid.get("pattern", {})
+            label = next((value.get("label") for value in eid.values()
+                          if isinstance(value, dict) and value.get("label")), None)
+            description = a.get("description") or ""
             diag = {
                 "kind": "analysis_error" if a.get("reason") in
                         ("ANALYSIS_FAILURE", "LOADING_FAILURE") else "aborted",
                 "reason": a.get("reason"),
-                "errors": [],
-                "description": (a.get("description") or "")[:500],
+                "errors": parse_diagnostics(description),
+                "description": description[:500],
+                "event_id": eid,
             }
-            self.add_diag(diag, label if isinstance(label, str) else None)
+            if description:
+                diag["evidence"] = self.ev.add("analysis", description)
+            fp = self.add_diag(diag, label, eid)
+            if eid:
+                key = self.event_key(eid)
+                self._abort_events[key] = fp
+                self._abort_children[key] = [self.event_key(child)
+                                             for child in ev.get("children", [])]
 
         elif "completed" in ev:
             if not ev["completed"].get("success", True):
@@ -699,6 +790,8 @@ class Container:
                 "name": f.get("exitCode", {}).get("name"),
             }
             self.invocation["overall_success"] = f.get("overallSuccess", False)
+            if f.get("failureDetail"):
+                self.invocation["failure_detail"] = f["failureDetail"]
 
         elif "buildMetrics" in ev:
             self.invocation["metrics"] = self._metrics(ev["buildMetrics"])
@@ -780,9 +873,32 @@ class Container:
 
     # -- output -----------------------------------------------------------
     def finish(self, input_bytes: int) -> dict[str, Any]:
+        resolved = self._resolved_diagnostics()
+        failure = self.invocation.get("failure_detail", {})
+        failed = self.invocation.get("exit", {}).get("code") not in (None, 0)
+        if failed and not resolved:
+            resolved.append({"kind": "invocation_failure", "_targets": [],
+                             "description": failure.get("message") or
+                             "Bazel failed without a structured diagnostic."})
+        # Global logs are evidence about the invocation, not proof of which
+        # target caused an error. Keep that distinction explicit in the output.
+        fallback = self._progress_stderr
+        if self.console_output and self.console_output != fallback:
+            fallback = self.console_output + ("\n[BEP progress]\n" + fallback if fallback else "")
+        if fallback and (failed or resolved):
+            lines = [line for line in fallback.splitlines() if not _NOISE.match(line)]
+            start = next((i for i, line in enumerate(lines) if line.startswith("ERROR:")), 0)
+            self.invocation["failure_context"] = bounded_log("\n".join(lines[start:start + 20]), 2048)
+        for d in resolved:
+            if not (d.get("description") or d.get("failure_message") or
+                    d.get("errors") or d.get("cases")):
+                d["description"] = (failure.get("message") or
+                                    f"{d.get('reason', 'Failure')}: no detailed message available.")
+            if not d.get("evidence") and fallback:
+                d["evidence"] = self.ev.add("invocation_log", fallback)
+                d["evidence_scope"] = "invocation"
         diags = []
-        for fp in self._order[:MAX_DIAGNOSTICS]:
-            d = self._diags[fp]
+        for d in resolved[:MAX_DIAGNOSTICS]:
             targets = d.pop("_targets", [])
             if targets:
                 d["target"] = targets[0]
@@ -793,7 +909,7 @@ class Container:
             d["id"] = f"d{len(diags) + 1}"
             diags.append(d)
 
-        omitted = max(0, len(self._order) - MAX_DIAGNOSTICS)
+        omitted = max(0, len(resolved) - MAX_DIAGNOSTICS)
         # evidence for dropped diagnostics is dead weight
         live = {d["evidence"] for d in diags if "evidence" in d}
         evidence = {k: v for k, v in self.ev.store.items() if k in live}
@@ -851,6 +967,10 @@ def tail_events(path: str, is_alive) -> Iterator[dict[str, Any]]:
     """
     import time
     pending = ""
+    while not os.path.exists(path):
+        if not is_alive():
+            return
+        time.sleep(0.05)
     with open(path, "r", errors="replace") as fh:
         while True:
             chunk = fh.read()
@@ -909,9 +1029,14 @@ def run_bazel(argv: list[str], c: "Container", emit_progress: bool,
     else:
         cmd = ["bazel", *argv, *own_flags]
 
-    # Bazel's own console output is the thing we are replacing; keep it out of
-    # the agent's stdout but preserve it for humans.
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # A file avoids pipe backpressure while preserving startup and fetch errors
+    # that may never reach the BEP. Only bounded context enters the report.
+    console = tempfile.TemporaryFile(mode="w+b")
+    try:
+        proc = subprocess.Popen(cmd, stdout=console, stderr=console)
+    except BaseException:
+        console.close()
+        raise
 
     # wait for the file to appear before tailing
     import time
@@ -937,18 +1062,35 @@ def run_bazel(argv: list[str], c: "Container", emit_progress: bool,
                         "event": "diagnostic",
                         "kind": d.get("kind"),
                         "target": (d.get("_targets") or [None])[0],
-                        "first_error": (d.get("errors") or [{}])[0].get("message"),
+                        "first_error": ((d.get("errors") or [{}])[0].get("message")
+                                        or d.get("description") or d.get("failure_message")
+                                        or d.get("reason")),
                     }, separators=(",", ":")), file=sys.stderr, flush=True)
                 seen = len(c._order)
-            if fail_fast and len(c._order) >= fail_fast and not killed:
+            # Empty analysis parents are placeholders, not distinct causes.
+            causes = sum(bool(d.get("errors") or d.get("cases") or d.get("evidence")
+                              or d.get("description") or d.get("failure_message"))
+                         for d in c._resolved_diagnostics()) if fail_fast else 0
+            if fail_fast and causes >= fail_fast and not killed:
                 # enough distinct root causes; stop burning CI time.
                 # SIGINT lets Bazel finish writing BuildMetrics and Aborted events.
                 proc.send_signal(2)
                 killed = True
                 c.invocation["stopped_early"] = {"reason": "fail_fast",
-                                                 "distinct_causes": len(c._order)}
+                                                 "distinct_causes": causes}
     finally:
         code = proc.wait()
+        console.seek(0, os.SEEK_END)
+        console_size = console.tell()
+        console.seek(0)
+        captured = console.read(32768)
+        if console_size > 32768:
+            console.seek(max(32768, console_size - 32768))
+            if console_size > 65536:
+                captured += b"\n[... invocation output omitted ...]\n"
+            captured += console.read(32768)
+        c.console_output = captured.decode("utf-8", "replace")
+        console.close()
         size = os.path.getsize(bep) if os.path.exists(bep) else 0
         if ephemeral:
             try:
@@ -1075,13 +1217,20 @@ def render_text(result: dict[str, Any]) -> str:
         out.append("  " + ", ".join(bits))
     if inv.get("stopped_early"):
         out.append(f"  stopped early: {inv['stopped_early']['reason']}")
+    if inv.get("failure_context"):
+        out.append("invocation context:")
+        out.extend("  " + line for line in inv["failure_context"].splitlines())
 
+    shown_evidence = set()
     for d in result.get("diagnostics", []):
         n = d.get("affected_count")
         tag = f"[{d['id']}] {d.get('kind')}"
         if n:
             tag += f" x{n} targets"
         out.append(tag + f"  {d.get('target','')}")
+        message = d.get("description") or d.get("failure_message")
+        if message:
+            out.extend("  " + line for line in message.splitlines())
         for e in d.get("errors", [])[:3]:
             loc = e.get("file", "")
             if e.get("line"):
@@ -1092,11 +1241,27 @@ def render_text(result: dict[str, Any]) -> str:
         for c in d.get("cases", [])[:5]:
             out.append(f"  FAIL {c.get('class','')}.{c['case']}: {c.get('message','')[:160]}")
         if d.get("failure_category"):
-            out.append(f"  category: {d['failure_category']}")
+            category = d["failure_category"]
+            if d.get("failure_code"):
+                category += f"/{d['failure_code']}"
+            out.append(f"  category: {category}")
         if d.get("repro"):
             out.append(f"  repro: {d['repro']}")
         if d.get("evidence"):
-            out.append(f"  log: bzlog-show {d['evidence']}")
+            ref = d["evidence"]
+            if d.get("evidence_scope") == "invocation":
+                out.append("  log scope: invocation (not attributed to this target)")
+            blob = result.get("evidence", {}).get(ref)
+            if blob:
+                if ref in shown_evidence:
+                    out.append(f"  log: {ref} (shown above)")
+                else:
+                    out.append(f"  log: {ref}")
+                    out.extend("    " + line for line in blob["text"].splitlines())
+                    shown_evidence.add(ref)
+            elif result.get("evidence_sidecar"):
+                import shlex
+                out.append(f"  log: bzlog show {shlex.quote(result['evidence_sidecar'])} {ref}")
 
     m = inv.get("metrics")
     if m:
@@ -1104,8 +1269,31 @@ def render_text(result: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def show_evidence(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="bzlog show", description="Read a saved evidence excerpt.")
+    ap.add_argument("sidecar", help="evidence_sidecar path from a bzlog report")
+    ap.add_argument("evidence_id", help="evidence reference, e.g. e1")
+    args = ap.parse_args(argv)
+    try:
+        with open(args.sidecar) as fh:
+            blobs = json.load(fh)
+        entry = blobs[args.evidence_id]
+        text = entry["text"]
+        if not isinstance(text, str):
+            raise ValueError("evidence text must be a string")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"bzlog show: cannot read {args.evidence_id}: {exc}", file=sys.stderr)
+        return 2
+    print(text)
+    if entry.get("truncated"):
+        print("bzlog show: this is a truncated evidence excerpt", file=sys.stderr)
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["show"]:
+        return show_evidence(argv[1:])
     own, rest = split_argv(argv)
 
     ap = argparse.ArgumentParser(
@@ -1123,7 +1311,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--pretty", action="store_true")
     ap.add_argument("--format", choices=["json", "text"], default="json")
     ap.add_argument("--evidence", choices=["inline", "ref", "none"], default="ref",
-                    help="inline: full logs in the container; ref: keep them in a "
+                    help="inline: evidence excerpts in the report; ref: keep them in a "
                          "sidecar for on-demand fetch (default); none: drop")
     ap.add_argument("--all-metrics", action="store_true",
                     help="always emit build metrics instead of only anomalies")
@@ -1153,7 +1341,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         # subprocess uses -N for signal N; expose the conventional shell status.
         if exit_code < 0:
             exit_code = 128 - exit_code
-        c.invocation.setdefault("exit", {})["code"] = exit_code
+        status = c.invocation.setdefault("exit", {})
+        if status.get("code") != exit_code:
+            status.pop("name", None)
+        status["code"] = exit_code
+        c.invocation["overall_success"] = exit_code == 0
 
     result = c.finish(size)
     enrich(result, args.root or c.root)
@@ -1163,13 +1355,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.evidence != "inline":
         blobs = result.pop("evidence", {})
         if args.evidence == "ref" and blobs:
-            side = os.path.join(os.environ.get("TMPDIR", "/tmp"), "bzlog-evidence.json")
+            import tempfile
+            side = None
             try:
-                with open(side, "w") as fh:
+                fd, side = tempfile.mkstemp(prefix="bzlog-evidence-", suffix=".json")
+                with os.fdopen(fd, "w") as fh:
                     json.dump(blobs, fh)
                 result["evidence_sidecar"] = side
-            except OSError:
-                pass
+            except OSError as exc:
+                # Never leave dangling references when persistence fails.
+                result["evidence"] = blobs
+                print(f"bzlog: cannot save evidence; keeping it inline: {exc}", file=sys.stderr)
+                if side:
+                    try:
+                        os.unlink(side)
+                    except OSError:
+                        pass
         for d in result.get("diagnostics", []):
             if args.evidence == "none":
                 d.pop("evidence", None)
