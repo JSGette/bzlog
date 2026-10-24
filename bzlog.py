@@ -1134,6 +1134,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         ap.error("need a Bazel command (e.g. `bzlog test //...`) or a BEP file")
 
     c = Container(root=args.root)
+    exit_code = 0
 
     # A lone existing file means post-hoc analysis; anything else is a build.
     if len(rest) == 1 and os.path.isfile(rest[0]) and rest[0] not in BAZEL_VERBS:
@@ -1149,6 +1150,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                   file=sys.stderr)
             return 2
         exit_code, size = run_bazel(rest, c, args.progress, args.fail_fast)
+        # subprocess uses -N for signal N; expose the conventional shell status.
+        if exit_code < 0:
+            exit_code = 128 - exit_code
         c.invocation.setdefault("exit", {})["code"] = exit_code
 
     result = c.finish(size)
@@ -1176,7 +1180,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         json.dump(result, sys.stdout, indent=2 if args.pretty else None,
                   separators=None if args.pretty else (",", ":"))
         print()
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

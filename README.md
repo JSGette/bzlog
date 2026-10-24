@@ -16,6 +16,11 @@ bzlog test //...
 bzlog --progress --fail-fast 3 coverage //... --combined_report=lcov
 ```
 
+When wrapping Bazel, bzlog prints the result and exits with Bazel's exit code.
+If the Bazel process is terminated by a signal, bzlog exits with `128 + signal`.
+Post-hoc analysis of a BEP file exits 0 after producing a report, even when the
+recorded build failed.
+
 bzlog's own flags come first; the first token it does not own starts Bazel's
 command line and everything after it is passed through untouched. An explicit
 `--` also ends bzlog's flags. Startup flags, `bazel run //x -- args`, and a
