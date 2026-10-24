@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 from urllib.parse import urlparse, unquote
 
-SCHEMA = "bzlog/v1"
+SCHEMA = "bzlog/v2"
 MAX_EVIDENCE_LINES = 40
 MAX_EVIDENCE_BYTES = 4096
 # Framework-extracted logs are already distilled, so they get a higher cap
@@ -42,6 +42,8 @@ MAX_EVIDENCE_BYTES = 4096
 MAX_EXTRACTED_LINES = 160
 MAX_EXTRACTED_BYTES = 16384
 MAX_DIAGNOSTICS = 25
+MAX_TEST_ATTEMPTS = 10
+FAILED_TEST_STATUSES = {"FAILED", "TIMEOUT", "REMOTE_FAILURE", "FAILED_TO_BUILD"}
 
 
 # --------------------------------------------------------------------------
@@ -576,10 +578,6 @@ class Container:
         self.counts = {
             "actions_failed": 0,
             "targets_failed": 0,
-            "tests_total": 0,
-            "tests_passed": 0,
-            "tests_failed": 0,
-            "tests_flaky": 0,
         }
         self._diags: dict[str, dict[str, Any]] = {}  # fingerprint -> diagnostic
         self._order: list[str] = []
@@ -587,6 +585,7 @@ class Container:
         self._abort_children: dict[str, list[str]] = {}
         self._progress_stderr = ""
         self.console_output = ""
+        self._tests: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def event_key(eid: dict[str, Any]) -> str:
@@ -595,7 +594,7 @@ class Container:
     def _resolved_diagnostics(self) -> list[dict[str, Any]]:
         """Link empty analysis parents to descriptive causes, in either event order."""
         diags = {fp: dict(d, _targets=list(d["_targets"]))
-                 for fp, d in self._diags.items()}
+                 for fp, d in self._diags.items() if d["kind"] != "test_failure"}
         dropped = set()
         for event, fp in self._abort_events.items():
             if diags[fp].get("description"):
@@ -619,7 +618,81 @@ class Container:
                     for target in diags[fp]["_targets"]:
                         if target not in diags[cause]["_targets"]:
                             diags[cause]["_targets"].append(target)
-        return [diags[fp] for fp in self._order if fp not in dropped]
+        return ([diags[fp] for fp in self._order if fp in diags and fp not in dropped]
+                + self._test_diagnostics())
+
+    def _test_record(self, tid: dict[str, Any]) -> dict[str, Any]:
+        identity = {"label": tid.get("label"), "configuration": tid.get("configuration")}
+        return self._tests.setdefault(self.event_key(identity), dict(identity, results={}))
+
+    def _test_diagnostics(self) -> list[dict[str, Any]]:
+        """Reconcile attempts with each configured test's authoritative summary."""
+        grouped: dict[str, dict[str, Any]] = {}
+        for test in self._tests.values():
+            summary = test.get("summary", test.get("target_summary"))
+            status = summary.get("overallStatus", "NO_STATUS") if summary is not None else "UNKNOWN"
+            failures = [result for _, result in sorted(test["results"].items())
+                        if result["status"] != "PASSED"]
+            if status == "PASSED" and not failures:
+                continue
+            kind = {"PASSED": "test_recovered", "FLAKY": "test_flaky"}.get(status)
+            if kind is None:
+                kind = "test_failure" if status in FAILED_TEST_STATUSES else (
+                    "test_attempt_failure" if failures else "test_incomplete")
+            if not failures:
+                diagnostic = {
+                    "kind": kind, "status": status, "overall_status": status,
+                    "final": summary is not None, "configuration": test["configuration"],
+                    "description": (f"Test summary: {status}; per-attempt diagnostics unavailable."
+                                    if summary is not None else
+                                    "Test results observed, but the final summary is unavailable."),
+                    "_targets": [test["label"]] if test["label"] else [],
+                }
+                if test.get("summary_evidence"):
+                    diagnostic["evidence"] = test["summary_evidence"]
+                grouped["summary:" + self.event_key({"label": test["label"],
+                                                     "configuration": test["configuration"]})] = diagnostic
+                continue
+            for result in failures:
+                d = dict(result, kind=kind, overall_status=status, final=summary is not None)
+                # Equal messages without logs do not establish equivalent failures.
+                if d.get("evidence"):
+                    key = self.event_key({"kind": kind, "overall_status": status,
+                                          "status": d["status"], "configuration": d["configuration"],
+                                          "evidence": d["evidence"], "cases": d.get("cases")})
+                else:
+                    key = self.event_key({"label": test["label"], "configuration": test["configuration"],
+                                          "run": d["run"], "shard": d["shard"], "attempt": d["attempt"]})
+                if key not in grouped:
+                    grouped[key] = dict(d, _targets=[], occurrences=0, attempts=[])
+                group = grouped[key]
+                label = test["label"]
+                if label and label not in group["_targets"]:
+                    group["_targets"].append(label)
+                group["occurrences"] += 1
+                if len(group["attempts"]) < MAX_TEST_ATTEMPTS:
+                    group["attempts"].append({"target": label, **{
+                        field: d[field] for field in
+                        ("run", "shard", "attempt", "status", "cached_locally", "cached_remotely")
+                    }})
+                else:
+                    group["attempts_omitted"] = group["occurrences"] - MAX_TEST_ATTEMPTS
+        return list(grouped.values())
+
+    def _test_counts(self) -> dict[str, int]:
+        counts = {"tests_total": len(self._tests), "tests_passed": 0, "tests_flaky": 0,
+                  "tests_failed": 0, "tests_incomplete": 0}
+        for test in self._tests.values():
+            status = test.get("summary", test.get("target_summary", {})).get("overallStatus", "NO_STATUS")
+            if status == "PASSED":
+                counts["tests_passed"] += 1
+            elif status == "FLAKY":
+                counts["tests_flaky"] += 1
+            elif status in FAILED_TEST_STATUSES:
+                counts["tests_failed"] += 1
+            else:
+                counts["tests_incomplete"] += 1
+        return counts
 
     # -- fingerprinting is what collapses the fan-out ----------------------
     @staticmethod
@@ -634,7 +707,7 @@ class Container:
 
     def add_diag(self, diag: dict[str, Any], target: Optional[str],
                  event_id: Optional[dict[str, Any]] = None) -> str:
-        if diag.get("kind") in ("analysis_error", "aborted") or not (
+        if diag.get("kind") in ("analysis_error", "aborted", "test_failure") or not (
                 diag.get("errors") or diag.get("evidence")):
             # Aborts are joined through BEP edges. Missing evidence proves no
             # equivalence, even if both failures have the same action mnemonic.
@@ -715,10 +788,22 @@ class Container:
             status = r.get("status", "NO_STATUS")
             tid = eid.get("testResult", {})
             label = tid.get("label")
-            if status in ("PASSED",):
+            test = self._test_record(tid)
+            attempt_id = (int(tid.get("run", 1)), int(tid.get("shard", 1)),
+                          int(tid.get("attempt", 1)))
+            if attempt_id in test["results"]:
                 return
-            if status == "FLAKY":
-                self.counts["tests_flaky"] += 1
+            ei = r.get("executionInfo", {})
+            diag = {
+                "kind": "test_failure", "status": status,
+                "run": attempt_id[0], "shard": attempt_id[1], "attempt": attempt_id[2],
+                "configuration": tid.get("configuration"),
+                "cached_locally": r.get("cachedLocally", False),
+                "cached_remotely": ei.get("cachedRemotely", False),
+            }
+            if status == "PASSED":
+                test["results"][attempt_id] = diag
+                return
             outputs = {o.get("name"): o for o in r.get("testActionOutput", [])}
             cases: list[dict[str, Any]] = []
             if "test.xml" in outputs:
@@ -731,31 +816,34 @@ class Container:
                                   total_lines=len(log_text.splitlines()))
             else:
                 ref = self.ev.add("test.log", log_text)
-            diag = {
-                "kind": "test_failure",
-                "status": status,
-                "attempt": int(tid.get("attempt", 1)),
-                "shard": int(tid.get("shard", 0)),
-                "cases": cases,
-                "errors": [],
-                "configuration": tid.get("configuration"),
-            }
-            ei = r.get("executionInfo", {})
+            diag.update(cases=cases, errors=[],
+                        description=r.get("statusDetails") or f"Test attempt status: {status}.")
             if ei.get("exitCode") is not None:
                 diag["exit_code"] = ei["exitCode"]
             if ei.get("strategy"):
                 diag["strategy"] = ei["strategy"]
             if ref:
                 diag["evidence"] = ref
-            self.add_diag(diag, label, eid)
+            test["results"][attempt_id] = diag
+            self.add_diag(diag, label, {"testResult": {
+                "label": label, "configuration": tid.get("configuration"),
+                "run": attempt_id[0], "shard": attempt_id[1], "attempt": attempt_id[2]}})
 
         elif "testSummary" in ev:
             s = ev["testSummary"]
-            self.counts["tests_total"] += 1
-            if s.get("overallStatus") == "PASSED":
-                self.counts["tests_passed"] += 1
-            else:
-                self.counts["tests_failed"] += 1
+            test = self._test_record(eid.get("testSummary", {}))
+            test["summary"] = s
+            if s.get("failed") and not test.get("summary_evidence"):
+                test["summary_evidence"] = self.ev.add(
+                    "test.log", read_file_message(s["failed"][0], self.root))
+
+        elif "targetSummary" in ev:
+            # Bazel can omit TestSummary for tests that failed to build. A
+            # non-test target has NO_STATUS and must not enter test counts.
+            status = ev["targetSummary"].get("overallTestStatus", "NO_STATUS")
+            if status != "NO_STATUS":
+                test = self._test_record(eid.get("targetSummary", {}))
+                test["target_summary"] = {"overallStatus": status}
 
         elif "aborted" in ev:
             a = ev["aborted"]
@@ -825,16 +913,36 @@ class Container:
         if mnem:
             out["by_mnemonic"] = mnem[:12]
 
-        # execution strategies; `remote cache hit` is where the RBE hit rate lives.
-        # NB: ActionSummary.remote_cache_hits is deprecated -- do not use it.
+        # Runner counters describe spawn outcomes; `total`, `internal`, and
+        # `action cache hit` count actions, so they must not enter this denominator.
+        # These counters cannot reveal the remote cache's lookup hit rate.
         runners = {r.get("name", "?"): int(r.get("count", 0))
-                   for r in asm.get("runnerCount", []) if int(r.get("count", 0))}
+                   for r in asm.get("runnerCount", []) if int(r.get("count", 0)) > 0}
         if runners:
             out["runners"] = dict(sorted(runners.items(), key=lambda kv: -kv[1]))
-            hits = sum(v for k, v in runners.items() if "cache hit" in k.lower())
-            total = sum(runners.values())
-            if total:
-                out["remote_cache_hit_rate"] = round(hits / total, 3)
+            kinds = {r.get("name"): r.get("execKind", "").lower()
+                     for r in asm.get("runnerCount", [])}
+            cache = {"remote_hits": 0, "disk_hits": 0, "other_hits": 0,
+                     "executions": 0, "remote_executions": 0}
+            for name, count in runners.items():
+                normalized = name.lower()
+                if normalized in ("total", "internal", "action cache hit"):
+                    continue
+                if normalized == "remote cache hit":
+                    cache["remote_hits"] += count
+                elif normalized == "disk cache hit":
+                    cache["disk_hits"] += count
+                elif normalized.endswith("cache hit"):
+                    cache["other_hits"] += count
+                else:
+                    cache["executions"] += count
+                    if kinds.get(name) == "remote" or normalized == "remote":
+                        cache["remote_executions"] += count
+            hits = cache["remote_hits"] + cache["disk_hits"] + cache["other_hits"]
+            outcomes = hits + cache["executions"]
+            if outcomes:
+                out["spawn_cache"] = {**cache, "outcomes": outcomes,
+                                      "hit_rate": round(hits / outcomes, 3)}
 
         # local action cache, with miss reasons
         acs = asm.get("actionCacheStatistics", {})
@@ -917,7 +1025,7 @@ class Container:
         out = {
             "schema": SCHEMA,
             "invocation": self.invocation,
-            "summary": {k: v for k, v in self.counts.items() if v},
+            "summary": {k: v for k, v in {**self.counts, **self._test_counts()}.items() if v},
             "diagnostics": diags,
             "evidence": evidence,
         }
@@ -1065,12 +1173,23 @@ def run_bazel(argv: list[str], c: "Container", emit_progress: bool,
                         "first_error": ((d.get("errors") or [{}])[0].get("message")
                                         or d.get("description") or d.get("failure_message")
                                         or d.get("reason")),
+                        **({"provisional": True, **{field: d.get(field) for field in
+                             ("configuration", "run", "shard", "attempt")}}
+                           if d.get("kind") == "test_failure" else {}),
                     }, separators=(",", ":")), file=sys.stderr, flush=True)
                 seen = len(c._order)
+            if emit_progress and "testSummary" in ev:
+                print(json.dumps({"event": "test_summary",
+                                  "target": ev.get("id", {}).get("testSummary", {}).get("label"),
+                                  "configuration": ev.get("id", {}).get("testSummary", {}).get("configuration"),
+                                  "status": ev["testSummary"].get("overallStatus", "NO_STATUS")},
+                                 separators=(",", ":")), file=sys.stderr, flush=True)
             # Empty analysis parents are placeholders, not distinct causes.
             causes = sum(bool(d.get("errors") or d.get("cases") or d.get("evidence")
                               or d.get("description") or d.get("failure_message"))
-                         for d in c._resolved_diagnostics()) if fail_fast else 0
+                         for d in c._resolved_diagnostics()
+                         if d["kind"] not in ("test_flaky", "test_recovered", "test_attempt_failure",
+                                              "test_incomplete")) if fail_fast else 0
             if fail_fast and causes >= fail_fast and not killed:
                 # enough distinct root causes; stop burning CI time.
                 # SIGINT lets Bazel finish writing BuildMetrics and Aborted events.
@@ -1167,7 +1286,8 @@ def enrich(result: dict[str, Any], root: Optional[str], snippet_lines: int = 2) 
         tgt = d.get("target")
         if not tgt:
             continue
-        if d.get("kind") == "test_failure":
+        if d.get("kind") in ("test_failure", "test_flaky", "test_recovered",
+                             "test_attempt_failure", "test_incomplete"):
             cases = d.get("cases") or []
             cmd = f"bazel test {tgt}"
             if cases:
@@ -1184,16 +1304,15 @@ def prune_metrics(inv: dict[str, Any]) -> None:
     if not m:
         return
     keep: dict[str, Any] = {}
-    hit = m.get("remote_cache_hit_rate")
-    if hit is not None and hit < 0.7:
-        keep["remote_cache_hit_rate"] = hit
+    cache = m.get("spawn_cache", {})
+    hit = cache.get("hit_rate")
+    cache_activity = sum(cache.get(k, 0) for k in
+                         ("remote_hits", "disk_hits", "other_hits", "remote_executions"))
+    if hit is not None and hit < 0.7 and cache_activity:
+        keep["spawn_cache"] = cache
         keep["runners"] = m.get("runners")
-    ac = m.get("action_cache", {})
-    reasons = ac.get("miss_reasons", {})
-    # DIGEST_MISMATCH at scale means non-hermeticity, which is actionable
-    if reasons.get("DIGEST_MISMATCH", 0) > max(50, 0.1 * (ac.get("misses") or 0)):
-        keep["action_cache"] = {"misses": ac.get("misses"),
-                                "miss_reasons": {"DIGEST_MISMATCH": reasons["DIGEST_MISMATCH"]}}
+    # Digest mismatches include ordinary source edits. Keep the raw miss reasons
+    # under --all-metrics, but do not infer non-hermeticity from this count alone.
     t = m.get("timing", {})
     if t.get("wall_ms", 0) > 120_000:
         keep["timing"] = t
@@ -1228,6 +1347,18 @@ def render_text(result: dict[str, Any]) -> str:
         if n:
             tag += f" x{n} targets"
         out.append(tag + f"  {d.get('target','')}")
+        if "overall_status" in d:
+            note = "" if d.get("final") else " (final summary unavailable)"
+            out.append(f"  test status: {d['overall_status']}{note}")
+            if d.get("occurrences"):
+                out.append(f"  {d['occurrences']} unsuccessful attempt(s)")
+            for attempt in d.get("attempts", []):
+                cached = (" [local cache]" if attempt["cached_locally"] else
+                          " [remote cache]" if attempt["cached_remotely"] else "")
+                out.append(f"    {attempt['target']} run={attempt['run']} shard={attempt['shard']}"
+                           f" attempt={attempt['attempt']}: {attempt['status']}{cached}")
+            if d.get("attempts_omitted"):
+                out.append(f"    {d['attempts_omitted']} additional attempt(s) omitted")
         message = d.get("description") or d.get("failure_message")
         if message:
             out.extend("  " + line for line in message.splitlines())

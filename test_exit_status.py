@@ -90,14 +90,7 @@ class ExitStatusTest(unittest.TestCase):
         self.assertIn("No space left on device", report["invocation"]["failure_context"])
         self.assertEqual(report["diagnostics"][0]["kind"], "invocation_failure")
 
-    @unittest.skipUnless(os.name == "posix", "POSIX signals and executable shebang")
-    def test_fail_fast_waits_for_the_analysis_root_cause(self):
-        cause = {"configuredLabel": {"label": "//dep"}}
-        events = [
-            {"id": {"targetConfigured": {"label": "//target"}}, "children": [cause],
-             "aborted": {"reason": "ANALYSIS_FAILURE"}},
-            {"id": cause, "aborted": {"reason": "ANALYSIS_FAILURE", "description": "disk full"}},
-        ]
+    def stream_events(self, events, wait_after=0):
         fake = self.root / "bazel"
         fake.write_text(
             f"#!{sys.executable}\n"
@@ -110,16 +103,54 @@ class ExitStatusTest(unittest.TestCase):
             "        out.write(json.dumps(event) + '\\n')\n"
             "        out.flush()\n"
             "        time.sleep(0.25)\n"
-            "time.sleep(5)\n"
+            f"time.sleep({wait_after})\n"
         )
         fake.chmod(0o755)
         env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ["PATH"],
                    TMPDIR=str(self.root))
-        result = self.invoke("--fail-fast", "1", "build", "//target", env=env)
+        return self.invoke("--progress", "--fail-fast", "1", "test", "//target", env=env)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signals and executable shebang")
+    def test_fail_fast_waits_for_the_analysis_root_cause(self):
+        cause = {"configuredLabel": {"label": "//dep"}}
+        events = [
+            {"id": {"targetConfigured": {"label": "//target"}}, "children": [cause],
+             "aborted": {"reason": "ANALYSIS_FAILURE"}},
+            {"id": cause, "aborted": {"reason": "ANALYSIS_FAILURE", "description": "disk full"}},
+        ]
+        result = self.stream_events(events, wait_after=5)
         self.assertEqual(result.returncode, 8, result.stderr)
         report = json.loads(result.stdout)
         self.assertEqual(len(report["diagnostics"]), 1)
         self.assertEqual(report["diagnostics"][0]["description"], "disk full")
+        self.assertEqual(report["invocation"]["stopped_early"]["distinct_causes"], 1)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signals and executable shebang")
+    def test_fail_fast_allows_a_flaky_retry_to_finish(self):
+        from test_results import result as attempt, summary
+
+        result = self.stream_events([attempt("FAILED"), attempt("PASSED", attempt=2), summary("FLAKY")])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertNotIn("stopped_early", report["invocation"])
+        self.assertEqual(report["diagnostics"][0]["kind"], "test_flaky")
+        progress = [json.loads(line) for line in result.stderr.splitlines()]
+        self.assertTrue(progress[0]["provisional"])
+        self.assertEqual(progress[0]["configuration"], {"id": "cfg"})
+        self.assertEqual((progress[0]["run"], progress[0]["shard"], progress[0]["attempt"]), (1, 1, 1))
+        self.assertEqual(progress[-1]["event"], "test_summary")
+        self.assertEqual(progress[-1]["status"], "FLAKY")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signals and executable shebang")
+    def test_fail_fast_stops_on_a_confirmed_test_failure(self):
+        from test_results import result as attempt, summary
+
+        result = self.stream_events([attempt("FAILED"), attempt("FAILED", attempt=2), summary("FAILED")],
+                                    wait_after=5)
+        self.assertEqual(result.returncode, 8, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["diagnostics"][0]["kind"], "test_failure")
+        self.assertEqual(report["diagnostics"][0]["occurrences"], 2)
         self.assertEqual(report["invocation"]["stopped_early"]["distinct_causes"], 1)
 
     def test_post_hoc_failed_build_still_exits_zero(self):

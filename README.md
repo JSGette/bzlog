@@ -78,6 +78,11 @@ Unrecognized logs fall back to the tail. Extracted evidence carries
 
 ## Container shape
 
+Reports use `schema: "bzlog/v2"`. Compared with v1, test diagnostics distinguish
+final failures from flaky, recovered, and incomplete outcomes, and cache metrics
+use `spawn_cache.hit_rate` instead of `remote_cache_hit_rate`. Consumers should
+handle the new diagnostic kinds and metric field described below.
+
 - `invocation` — uuid, command, patterns, exit code, build metrics
 - `summary` — counts only
 - `diagnostics` — normalized failures, deduped by root cause
@@ -118,6 +123,37 @@ brief invocation context remain visible in every mode.
 
 Regression checks: `python3 -m unittest discover` and `python3 test_truncate.py`.
 
+## Test outcomes and retries
+
+Test counts are per target **and configuration**, using `TestSummary` for the
+final outcome. If Bazel omits it, a test status from `TargetSummary` is used
+instead, including `FAILED_TO_BUILD`; non-test target summaries are ignored.
+`tests_passed`, `tests_flaky`, `tests_failed`, and
+`tests_incomplete` are separate categories; their sum is `tests_total`, the
+number of configured tests observed in results or summaries. Repeated events
+do not inflate counts. When neither summary is available, a test remains
+incomplete even when a passing or failing attempt has been observed.
+
+Failed attempts retain their evidence after reconciliation:
+
+- `test_failure`: a final failing summary, including timeouts and remote failures.
+- `test_flaky`: the final summary is `FLAKY`.
+- `test_recovered`: earlier unsuccessful attempts with a final `PASSED` summary.
+- `test_attempt_failure`: unsuccessful attempts without a conclusive final status.
+- `test_incomplete`: no conclusive final status and no unsuccessful attempt evidence.
+
+Diagnostics carry `overall_status`; `final` indicates whether a summary was
+received. Grouped failures retain a bounded `attempts` list with target, run,
+shard, attempt, status, and cache provenance. `occurrences` counts unsuccessful
+attempts, while `affected_count` counts distinct target labels. Additional
+attempts are counted in `attempts_omitted`. Summary-only failures still produce a
+diagnostic, using a referenced failed log when available.
+
+Live test diagnostics are marked `provisional`. A later `test_summary` progress
+event supplies the final status. `--fail-fast` waits for a conclusive failing
+test summary so that retries can complete; flaky and recovered tests do not
+trigger cancellation.
+
 ## Not done yet
 
 - compact exec log (`--execution_log_compact_file`, zstd + `spawn.proto`) for
@@ -140,9 +176,30 @@ Regression checks: `python3 -m unittest discover` and `python3 test_truncate.py`
 `--format text` drops JSON punctuation, which is ~30% of the token cost and
 carries no information the model needs. Keep JSON when a harness parses it.
 
-Metrics are reported by exception: a healthy cache hit rate is not news, so the
-block only appears when something is off (hit rate below 0.7, DIGEST_MISMATCH at
-scale, wall time above two minutes). `--all-metrics` overrides.
+Metrics are reported by exception: the block appears for a spawn cache hit rate
+below 0.7 when cache hits or remote executions were observed, or wall time above
+two minutes. A purely local build does not generate a cache anomaly.
+`--all-metrics` includes all collected metrics.
+
+`spawn_cache` reports `remote_hits`, `disk_hits`, `other_hits`, `executions`,
+`remote_executions` (a subset of executions), `outcomes`, and `hit_rate`:
+
+```
+hits = remote_hits + disk_hits + other_hits
+outcomes = hits + executions
+hit_rate = hits / outcomes
+```
+
+These are observed spawn outcomes, not remote cache lookup requests. Aggregate
+`total`, `internal`, and `action cache hit` runner counters count actions and are
+excluded. Raw runner counts and separate local `action_cache` statistics remain
+available with `--all-metrics`. The misleading `remote_cache_hit_rate` field has
+been replaced by `spawn_cache.hit_rate`; consumers should update accordingly.
+For example, 90 remote hits and 10 executions now yield 0.9 instead of 0.45.
+
+Local action-cache `DIGEST_MISMATCH` counts remain available with `--all-metrics`.
+They are not automatically classified as anomalies: normal source edits change
+digests, so this count alone does not establish non-hermeticity.
 
 Each diagnostic carries a `repro` command and, where the error has a file and
 line, the surrounding source lines -- both exist to save the agent a tool call.
