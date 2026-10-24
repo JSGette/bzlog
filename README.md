@@ -16,6 +16,13 @@ bzlog test //...
 bzlog --progress --fail-fast 3 coverage //... --combined_report=lcov
 ```
 
+For replay metadata, add `--record-command` before the Bazel command. It records
+the original argv, a shell-quoted command, and working directory. This is opt-in
+because arguments can contain credentials and lengthy configuration. The
+environment, rc-file contents, executable version, and source revision still
+need to match; diagnostic-level `repro` commands are only suggestions and do
+not invent framework-specific test filters.
+
 When wrapping Bazel, bzlog prints the result and exits with Bazel's exit code.
 If the Bazel process is terminated by a signal, bzlog exits with `128 + signal`.
 Post-hoc analysis of a BEP file exits 0 after producing a report, even when the
@@ -25,6 +32,29 @@ bzlog's own flags come first; the first token it does not own starts Bazel's
 command line and everything after it is passed through untouched. An explicit
 `--` also ends bzlog's flags. Startup flags, `bazel run //x -- args`, and a
 user-supplied `--build_event_json_file=` are all handled.
+The separate-value form `--build_event_json_file PATH` also works. The last
+Bazel-side occurrence wins; arguments after `bazel run ... --` belong to the
+program. An existing BEP file is consumed only after the new process changes
+it, so an old failure cannot trigger cancellation of a new invocation.
+
+## Stream integrity
+
+`invocation.stream` distinguishes `complete`, `incomplete`, `unavailable`, and
+`degraded` input. A complete stream has a build-finished event, a terminal
+`lastMessage`, and no unfulfilled announced child events. This describes
+transport integrity, not build success. Empty input is unavailable; malformed
+records, skipped handler events, or a trailing fragment make it degraded.
+The report includes event/error counts and missing-event counts when relevant.
+Text mode surfaces any non-complete state. Post-hoc reporting still exits zero:
+automation should inspect both stream integrity and the recorded Bazel outcome.
+
+Both readers accept NDJSON and pretty-printed JSON. Braces inside strings do
+not frame events; live reads preserve partial UTF-8 bytes until a line is ready.
+The reader tracks event identities to detect missing middle events, so memory
+still scales with the number of distinct event IDs. It does not authenticate
+input, reconstruct entirely unannounced events, or impose a per-record limit.
+Original Bazel exit status remains authoritative in wrapper mode. A missing or
+unlaunchable Bazel executable produces a report and exits 127 or 126.
 
 BEP is written incrementally: `FileTransport` runs a writer thread that flushes
 a `BufferedOutputStream` every 250ms (`EXPERIMENTAL_BEP_FILE_FLUSH_MILLIS`), and
@@ -75,6 +105,8 @@ mnemonic lies on custom test wrappers):
 Unrecognized logs fall back to the tail. Extracted evidence carries
 `framework`, `kept_lines`, `total_lines`. Golden tests: `testdata/` +
 `python3 test_truncate.py` (`--update` to regenerate).
+Framework evidence is marked `distilled`; removing original lines also marks
+it truncated, so `bzlog show` can disclose that it is an excerpt.
 
 ## Container shape
 
@@ -203,3 +235,15 @@ digests, so this count alone does not establish non-hermeticity.
 
 Each diagnostic carries a `repro` command and, where the error has a file and
 line, the surrounding source lines -- both exist to save the agent a tool call.
+
+## Validation and development
+
+Run `python3 -m unittest discover` and `python3 test_truncate.py`.
+`testdata/bazel-9.3` contains reduced real streams from Bazel's C++ tests,
+including compiler, gtest, loading, caching, and retry cases.
+
+Fail-fast only reconciles diagnostics on events that can add a failure. Passing
+tests and progress no longer rescan every accumulated test. The isolated loop
+benchmark is `python3 benchmarks/fail_fast.py`; its result is not a whole-build
+speedup. See [WSL validation and decisions](docs/WSL_VALIDATION_2026-10-24.md)
+and [lessons learned](docs/LESSONS_LEARNED.md) for evidence and next work.

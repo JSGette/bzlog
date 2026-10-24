@@ -1,0 +1,13 @@
+{"id":{"started":{}},"children":[{"progress":{}},{"unstructuredCommandLine":{}},{"structuredCommandLine":{"commandLineLabel":"original"}},{"structuredCommandLine":{"commandLineLabel":"canonical"}},{"structuredCommandLine":{"commandLineLabel":"tool"}},{"buildMetadata":{}},{"optionsParsed":{}},{"workspaceStatus":{}},{"pattern":{"pattern":["//src/test/cpp/util:bzlog_missing_target"]}},{"buildFinished":{}}],"started":{"uuid":"4ffe6937-c981-4ca4-97b2-443a90f44a4e","buildToolVersion":"9.3.0","command":"build","workspaceDirectory":"/workspace/bazel"}}
+{"id":{"buildMetadata":{}}}
+{"id":{"unstructuredCommandLine":{}}}
+{"id":{"optionsParsed":{}}}
+{"id":{"structuredCommandLine":{"commandLineLabel":"original"}}}
+{"id":{"structuredCommandLine":{"commandLineLabel":"tool"}}}
+{"id":{"pattern":{"pattern":["//src/test/cpp/util:bzlog_missing_target"]}},"aborted":{"reason":"LOADING_FAILURE","description":"no such target '//src/test/cpp/util:bzlog_missing_target': target 'bzlog_missing_target' not declared in package 'src/test/cpp/util' defined by /workspace/bazel/src/test/cpp/util/BUILD"}}
+{"id":{"workspaceStatus":{}}}
+{"id":{"buildFinished":{}},"children":[{"buildToolLogs":{}},{"buildMetrics":{}}],"finished":{"finishTimeMillis":"1792871970065","exitCode":{"name":"BUILD_FAILURE","code":1},"finishTime":"2026-10-24T19:59:30.065Z","failureDetail":{"message":"no such target '//src/test/cpp/util:bzlog_missing_target': target 'bzlog_missing_target' not declared in package 'src/test/cpp/util' defined by /workspace/bazel/src/test/cpp/util/BUILD","packageLoading":{"code":"TARGET_MISSING"}}}}
+{"id":{"structuredCommandLine":{"commandLineLabel":"canonical"}}}
+{"id":{"progress":{}}}
+{"id":{"buildToolLogs":{}}}
+{"id":{"buildMetrics":{}},"lastMessage":true,"buildMetrics":{"actionSummary":{"runnerCount":[{"name":"total"}]},"timingMetrics":{"cpuTimeInMs":"250","wallTimeInMs":"100"}}}

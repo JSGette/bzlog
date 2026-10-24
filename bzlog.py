@@ -563,11 +563,48 @@ class Evidence:
         entry: dict[str, Any] = {"kind": kind, "truncated": truncated, "text": body}
         if framework:
             entry["framework"] = framework
+            entry["distilled"] = True
             entry["kept_lines"] = len(body.splitlines())
             if total_lines is not None:
                 entry["total_lines"] = total_lines
+                entry["truncated"] |= entry["kept_lines"] < total_lines
         self.store[ref] = entry
         return ref
+
+
+@dataclass
+class StreamStatus:
+    """Transport integrity, separate from Bazel's build/test outcome."""
+    events_read: int = 0
+    malformed_records: int = 0
+    skipped_events: int = 0
+    trailing_fragment: bool = False
+    finished: bool = False
+    last_message: bool = False
+    _seen: set[str] = field(default_factory=set)
+    _pending: set[str] = field(default_factory=set)
+
+    def observe(self, event: dict[str, Any]) -> None:
+        eid = event.get("id")
+        if isinstance(eid, dict) and eid:
+            key = json.dumps(eid, sort_keys=True, separators=(",", ":"))
+            self._seen.add(key)
+            self._pending.discard(key)
+        for child in event.get("children", []):
+            key = json.dumps(child, sort_keys=True, separators=(",", ":"))
+            if key not in self._seen:
+                self._pending.add(key)
+
+    def as_dict(self) -> dict[str, Any]:
+        damaged = self.malformed_records or self.skipped_events or self.trailing_fragment
+        status = ('degraded' if damaged else 'unavailable' if not self.events_read else
+                  'complete' if self.finished and self.last_message and not self._pending else 'incomplete')
+        return {"status": status, "events_read": self.events_read,
+                "build_finished": self.finished, "last_message": self.last_message,
+                **({"malformed_records": self.malformed_records} if self.malformed_records else {}),
+                **({"skipped_events": self.skipped_events} if self.skipped_events else {}),
+                **({"unfulfilled_events": len(self._pending)} if self._pending else {}),
+                **({"trailing_fragment": True} if self.trailing_fragment else {})}
 
 
 class Container:
@@ -586,6 +623,20 @@ class Container:
         self._progress_stderr = ""
         self.console_output = ""
         self._tests: dict[str, dict[str, Any]] = {}
+        self.stream = StreamStatus()
+
+    def consume(self, ev: dict[str, Any]) -> None:
+        """Keep a bad event from hiding the rest of the stream, and disclose it."""
+        try:
+            self.stream.observe(ev)
+            self.handle(ev)
+        except Exception as exc:
+            self.stream.skipped_events += 1
+            if self.stream.skipped_events <= 3:
+                print(f"bzlog: skipped event: {exc}", file=sys.stderr)
+        else:
+            self.stream.finished |= "finished" in ev
+            self.stream.last_message |= ev.get("lastMessage") is True
 
     @staticmethod
     def event_key(eid: dict[str, Any]) -> str:
@@ -868,16 +919,24 @@ class Container:
                                              for child in ev.get("children", [])]
 
         elif "completed" in ev:
-            if not ev["completed"].get("success", True):
+            # Proto JSON omits scalar defaults: missing success means false.
+            if not ev["completed"].get("success", False):
                 self.counts["targets_failed"] += 1
 
         elif "finished" in ev:
             f = ev["finished"]
+            exit_status = f.get("exitCode")
+            # Within an existing ExitCode message an omitted int32 is zero;
+            # an absent message does not establish an invocation outcome.
+            code = exit_status.get("code", 0) if isinstance(exit_status, dict) else None
             self.invocation["exit"] = {
-                "code": f.get("exitCode", {}).get("code"),
-                "name": f.get("exitCode", {}).get("name"),
+                "code": code,
+                "name": (exit_status or {}).get("name"),
             }
-            self.invocation["overall_success"] = f.get("overallSuccess", False)
+            if code is not None:
+                self.invocation["overall_success"] = code == 0
+            elif "overallSuccess" in f:
+                self.invocation["overall_success"] = f["overallSuccess"]
             if f.get("failureDetail"):
                 self.invocation["failure_detail"] = f["failureDetail"]
 
@@ -981,6 +1040,7 @@ class Container:
 
     # -- output -----------------------------------------------------------
     def finish(self, input_bytes: int) -> dict[str, Any]:
+        self.invocation["stream"] = self.stream.as_dict()
         resolved = self._resolved_diagnostics()
         failure = self.invocation.get("failure_detail", {})
         failed = self.invocation.get("exit", {}).get("code") not in (None, 0)
@@ -1040,32 +1100,71 @@ class Container:
         return out
 
 
-def iter_events(path: str) -> Iterator[dict[str, Any]]:
-    """Bazel writes one JSON object per line, but older versions pretty-print."""
-    with open(path, "r", errors="replace") as fh:
-        buf = ""
-        depth = 0
-        for line in fh:
-            s = line.strip()
-            if not s:
+def _parse_event_lines(lines: Iterator[bytes], status: StreamStatus) -> Iterator[dict[str, Any]]:
+    """Fast NDJSON path, with string-aware framing for multiline objects."""
+    parts: list[bytes] = []
+    depth = 0
+    quoted = escaped = False
+    for line in lines:
+        if not parts:
+            if not line.strip():
                 continue
-            if depth == 0 and s.startswith("{") and s.endswith("}"):
-                try:
-                    yield json.loads(s)
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                if not line.lstrip().startswith(b'{'):
+                    status.malformed_records += 1
                     continue
-                except json.JSONDecodeError:
-                    pass
-            buf += line
-            depth += line.count("{") - line.count("}")
-            if depth <= 0 and buf.strip():
-                try:
-                    yield json.loads(buf)
-                except json.JSONDecodeError:
-                    pass
-                buf, depth = "", 0
+            else:
+                if isinstance(event, dict):
+                    status.events_read += 1
+                    yield event
+                else:
+                    status.malformed_records += 1
+                continue
+        parts.append(line)
+        for char in line:
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == 92:  # backslash
+                    escaped = True
+                elif char == 34:
+                    quoted = False
+            elif char == 34:
+                quoted = True
+            elif char in (123, 91):
+                depth += 1
+            elif char in (125, 93):
+                depth -= 1
+        if depth <= 0:
+            try:
+                event = json.loads(b''.join(parts))
+            except (ValueError, UnicodeDecodeError):
+                status.malformed_records += 1
+            else:
+                status.events_read += 1
+                yield event
+            parts, depth, quoted, escaped = [], 0, False, False
+    if parts:
+        status.trailing_fragment = True
 
 
-def tail_events(path: str, is_alive) -> Iterator[dict[str, Any]]:
+def iter_events(path: str, status: Optional[StreamStatus] = None) -> Iterator[dict[str, Any]]:
+    """Read NDJSON or pretty-printed BEP without silently losing malformed input."""
+    with open(path, "rb") as fh:
+        yield from _parse_event_lines(fh, status if status is not None else StreamStatus())
+
+
+def _file_signature(path: str):
+    try:
+        st = os.stat(path)
+        return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+    except FileNotFoundError:
+        return None
+
+
+def _tail_lines(path: str, is_alive, previous_signature=None) -> Iterator[bytes]:
     """Follow a BEP file while Bazel writes it.
 
     FileTransport flushes a BufferedOutputStream every 250ms
@@ -1074,38 +1173,58 @@ def tail_events(path: str, is_alive) -> Iterator[dict[str, Any]]:
     trailing newline and carry the remainder forward.
     """
     import time
-    pending = ""
-    while not os.path.exists(path):
+    pending = b""
+    while (signature := _file_signature(path)) is None or signature == previous_signature:
         if not is_alive():
+            # The writer may have created/replaced the file between stat and poll.
+            signature = _file_signature(path)
+            if signature is not None and signature != previous_signature:
+                break
             return
         time.sleep(0.05)
-    with open(path, "r", errors="replace") as fh:
+    with open(path, "rb") as fh:
         while True:
-            chunk = fh.read()
+            chunk = fh.read(65536)
             if chunk:
                 pending += chunk
-                *complete, pending = pending.split("\n")
+                *complete, pending = pending.split(b"\n")
                 for line in complete:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        yield json.loads(line)
-                    except json.JSONDecodeError:
-                        pass  # pretty-printed BEP: not supported in follow mode
+                    yield line + b"\n"
                 continue
             if not is_alive():
                 # drain whatever landed between the last read and process exit
-                rest = fh.read()
-                for line in (pending + rest).split("\n"):
-                    line = line.strip()
-                    if line:
-                        try:
-                            yield json.loads(line)
-                        except json.JSONDecodeError:
-                            pass
+                # The process may have written between our read and poll.
+                while chunk := fh.read(65536):
+                    pending += chunk
+                    *complete, pending = pending.split(b"\n")
+                    for line in complete:
+                        yield line + b"\n"
+                if pending:
+                    yield pending
                 return
             time.sleep(0.05)
+
+
+def tail_events(path: str, is_alive, status: Optional[StreamStatus] = None,
+                previous_signature=None) -> Iterator[dict[str, Any]]:
+    # Keep partial UTF-8 bytes intact until a complete line is available.
+    yield from _parse_event_lines(_tail_lines(path, is_alive, previous_signature),
+                                 status if status is not None else StreamStatus())
+
+
+def may_add_failure(ev: dict[str, Any]) -> bool:
+    """Only these events can increase the number of actionable root causes.
+
+    In particular, scanning every accumulated test on progress and passing
+    events makes a healthy invocation quadratic when --fail-fast is enabled.
+    Failed attempts still need reconciliation: a summary can arrive first.
+    """
+    return (isinstance(ev.get("aborted"), dict) or
+            (isinstance(ev.get("action"), dict) and not ev["action"].get("success")) or
+            any(isinstance(ev.get(key), dict) and ev[key].get(field) in FAILED_TEST_STATUSES
+                for key, field in (("testResult", "status"),
+                                   ("testSummary", "overallStatus"),
+                                   ("targetSummary", "overallTestStatus"))))
 
 
 def run_bazel(argv: list[str], c: "Container", emit_progress: bool,
@@ -1115,8 +1234,14 @@ def run_bazel(argv: list[str], c: "Container", emit_progress: bool,
     import tempfile
 
     # Respect a BEP path the user already asked for; otherwise use our own.
-    user_bep = next((a.split("=", 1)[1] for a in argv
-                     if a.startswith("--build_event_json_file=")), None)
+    cut = argv.index("--") if "--" in argv else len(argv)
+    bazel_args = argv[:cut]
+    user_bep = None
+    for i, arg in enumerate(bazel_args):
+        if arg.startswith("--build_event_json_file="):
+            user_bep = arg.split("=", 1)[1]
+        elif arg == "--build_event_json_file" and i + 1 < len(bazel_args):
+            user_bep = bazel_args[i + 1]
     own_flags: list[str] = []
     if user_bep:
         bep, ephemeral = user_bep, False
@@ -1125,44 +1250,33 @@ def run_bazel(argv: list[str], c: "Container", emit_progress: bool,
         os.close(fd)
         ephemeral = True
         own_flags.append(f"--build_event_json_file={bep}")
-    if not any(a.startswith("--build_event_json_file_path_conversion") for a in argv):
+    if not any(a.split("=", 1)[0] in ("--build_event_json_file_path_conversion",
+                                     "--nobuild_event_json_file_path_conversion") for a in bazel_args):
         # keep file:// URIs so stderr and test.log stay readable from disk
         own_flags.append("--build_event_json_file_path_conversion=false")
 
     # `bazel run //x -- args` : our flags must land before the separator,
     # otherwise they are handed to the target binary.
-    if "--" in argv:
-        cut = argv.index("--")
-        cmd = ["bazel", *argv[:cut], *own_flags, *argv[cut:]]
-    else:
-        cmd = ["bazel", *argv, *own_flags]
+    cmd = ["bazel", *bazel_args, *own_flags, *argv[cut:]]
+    previous_signature = _file_signature(bep)
 
     # A file avoids pipe backpressure while preserving startup and fetch errors
     # that may never reach the BEP. Only bounded context enters the report.
     console = tempfile.TemporaryFile(mode="w+b")
     try:
         proc = subprocess.Popen(cmd, stdout=console, stderr=console)
-    except BaseException:
+    except OSError as exc:
         console.close()
-        raise
-
-    # wait for the file to appear before tailing
-    import time
-    for _ in range(200):
-        if os.path.exists(bep) and os.path.getsize(bep) > 0:
-            break
-        if proc.poll() is not None:
-            break
-        time.sleep(0.05)
+        c.console_output = f"ERROR: cannot start Bazel: {exc}"
+        if ephemeral:
+            os.unlink(bep)
+        return (127 if isinstance(exc, FileNotFoundError) else 126), 0
 
     seen = 0
     killed = False
     try:
-        for ev in tail_events(bep, lambda: proc.poll() is None):
-            try:
-                c.handle(ev)
-            except Exception as exc:
-                print(f"bzlog: skipped event: {exc}", file=sys.stderr)
+        for ev in tail_events(bep, lambda: proc.poll() is None, c.stream, previous_signature):
+            c.consume(ev)
             if emit_progress and len(c._order) > seen:
                 for fp in c._order[seen:]:
                     d = c._diags[fp]
@@ -1189,8 +1303,9 @@ def run_bazel(argv: list[str], c: "Container", emit_progress: bool,
                               or d.get("description") or d.get("failure_message"))
                          for d in c._resolved_diagnostics()
                          if d["kind"] not in ("test_flaky", "test_recovered", "test_attempt_failure",
-                                              "test_incomplete")) if fail_fast else 0
-            if fail_fast and causes >= fail_fast and not killed:
+                                              "test_incomplete")) if (
+                             fail_fast and not killed and may_add_failure(ev)) else 0
+            if fail_fast and causes >= fail_fast and not killed and proc.poll() is None:
                 # enough distinct root causes; stop burning CI time.
                 # SIGINT lets Bazel finish writing BuildMetrics and Aborted events.
                 proc.send_signal(2)
@@ -1210,7 +1325,8 @@ def run_bazel(argv: list[str], c: "Container", emit_progress: bool,
             captured += console.read(32768)
         c.console_output = captured.decode("utf-8", "replace")
         console.close()
-        size = os.path.getsize(bep) if os.path.exists(bep) else 0
+        signature = _file_signature(bep)
+        size = signature[2] if signature and signature != previous_signature else 0
         if ephemeral:
             try:
                 os.unlink(bep)
@@ -1225,7 +1341,7 @@ BAZEL_VERBS = {
     "print_action", "query", "run", "shutdown", "sync", "test", "vendor", "version",
 }
 
-_OWN_BOOL = {"--pretty", "--progress", "--all-metrics"}
+_OWN_BOOL = {"--pretty", "--progress", "--all-metrics", "--record-command"}
 _OWN_VALUE = {"--root", "--fail-fast", "--max-diagnostics", "--format", "--evidence"}
 
 
@@ -1282,19 +1398,20 @@ def enrich(result: dict[str, Any], root: Optional[str], snippet_lines: int = 2) 
             lo, hi = max(0, line - 1 - snippet_lines), min(len(src), line + snippet_lines)
             e["context"] = [f"{i + 1}: {src[i].rstrip()[:120]}" for i in range(lo, hi)]
 
-        # 2. the exact command to reproduce one failure in isolation
+        # 2. A suggested narrow command. Original flags live in opt-in replay
+        # metadata; a framework-specific case filter cannot be inferred safely.
         tgt = d.get("target")
         if not tgt:
             continue
         if d.get("kind") in ("test_failure", "test_flaky", "test_recovered",
                              "test_attempt_failure", "test_incomplete"):
-            cases = d.get("cases") or []
-            cmd = f"bazel test {tgt}"
-            if cases:
-                cmd += f" --test_filter={cases[0].get('class','')}.{cases[0]['case']}".rstrip(".")
-            d["repro"] = cmd + " --test_output=streamed"
+            import shlex
+            d["repro"] = f"bazel test {shlex.quote(tgt)} --test_output=streamed"
         elif d.get("kind") in ("compile_error", "action_failure"):
-            d["repro"] = f"bazel build {tgt}"
+            import shlex
+            d["repro"] = f"bazel build {shlex.quote(tgt)}"
+        if d.get("repro"):
+            d["repro_scope"] = "suggested; original configuration and environment required"
 
 
 def prune_metrics(inv: dict[str, Any]) -> None:
@@ -1336,9 +1453,14 @@ def render_text(result: dict[str, Any]) -> str:
         out.append("  " + ", ".join(bits))
     if inv.get("stopped_early"):
         out.append(f"  stopped early: {inv['stopped_early']['reason']}")
+    stream = inv.get("stream", {})
+    if stream and stream.get("status") != "complete":
+        out.append("  stream: " + stream["status"] + " " + json.dumps(stream, separators=(",", ":")))
     if inv.get("failure_context"):
         out.append("invocation context:")
         out.extend("  " + line for line in inv["failure_context"].splitlines())
+    if inv.get("replay"):
+        out.append(f"replay argv (cwd {inv['replay']['cwd']}): {inv['replay']['command']}")
 
     shown_evidence = set()
     for d in result.get("diagnostics", []):
@@ -1377,7 +1499,7 @@ def render_text(result: dict[str, Any]) -> str:
                 category += f"/{d['failure_code']}"
             out.append(f"  category: {category}")
         if d.get("repro"):
-            out.append(f"  repro: {d['repro']}")
+            out.append(f"  suggested repro: {d['repro']}")
         if d.get("evidence"):
             ref = d["evidence"]
             if d.get("evidence_scope") == "invocation":
@@ -1446,7 +1568,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                          "sidecar for on-demand fetch (default); none: drop")
     ap.add_argument("--all-metrics", action="store_true",
                     help="always emit build metrics instead of only anomalies")
+    ap.add_argument("--record-command", action="store_true",
+                    help="include original Bazel argv and cwd for replay (may contain secrets)")
     args = ap.parse_args(own)
+    if args.max_diagnostics < 1:
+        ap.error("--max-diagnostics must be at least 1")
+    if args.fail_fast < 0:
+        ap.error("--fail-fast must be nonnegative")
     MAX_DIAGNOSTICS = args.max_diagnostics
 
     if not rest:
@@ -1457,17 +1585,20 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # A lone existing file means post-hoc analysis; anything else is a build.
     if len(rest) == 1 and os.path.isfile(rest[0]) and rest[0] not in BAZEL_VERBS:
-        for ev in iter_events(rest[0]):
-            try:
-                c.handle(ev)
-            except Exception as exc:  # never let one bad event kill the run
-                print(f"bzlog: skipped event: {exc}", file=sys.stderr)
+        for ev in iter_events(rest[0], c.stream):
+            c.consume(ev)
         size = os.path.getsize(rest[0])
     else:
         if rest[0] not in BAZEL_VERBS and not rest[0].startswith("-"):
             print(f"bzlog: '{rest[0]}' is not a Bazel command or an existing file",
                   file=sys.stderr)
             return 2
+        if args.record_command:
+            import shlex
+            replay_argv = ["bazel", *rest]
+            c.invocation["replay"] = {"argv": replay_argv, "cwd": os.getcwd(),
+                                      "command": shlex.join(replay_argv),
+                                      "scope": "argv only; environment, rc files and source state are not captured"}
         exit_code, size = run_bazel(rest, c, args.progress, args.fail_fast)
         # subprocess uses -N for signal N; expose the conventional shell status.
         if exit_code < 0:
