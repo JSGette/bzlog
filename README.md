@@ -2,6 +2,76 @@
 
 Collapse a Bazel Build Event Protocol stream into an agent-sized JSON container.
 
+**Version 0.0.1** · [Changelog](CHANGELOG.md) ·
+[Releases](https://github.com/JSGette/bzlog/releases) · Apache-2.0
+
+## Install and connect your coding agent
+
+Requires Python 3.10+ and Bazel on PATH for live builds. The core uses only the
+Python standard library. Use Linux, macOS, or **WSL on Windows**; run bzlog and
+Bazel inside the same environment as the agent's shell.
+
+```sh
+git clone --branch v0.0.1 https://github.com/JSGette/bzlog.git
+cd bzlog
+./install.sh
+export PATH="$HOME/.local/bin:$PATH"
+bzlog --version
+bzlog --help
+
+# Install instructions into an existing Bazel workspace for all three agents:
+./install.sh --agent all --project /path/to/workspace
+
+# Or choose individual agents (repeat --agent to combine):
+./install.sh --agent codex --agent claude --project /path/to/workspace
+./install.sh --agent cursor --project /path/to/workspace
+```
+
+The same commands work from an extracted release archive. `--prefix DIR`
+changes the default `~/.local` installation prefix; `--dry-run` previews all
+writes. `python3 install.py` is equivalent to `./install.sh`; set `PYTHON` to
+select the interpreter used by the shell script. Both modules are copied into
+`PREFIX/lib/bzlog`, with a launcher at `PREFIX/bin/bzlog`. The original source
+directory can then be moved or removed. Keep the selected Python interpreter
+installed, and add the bin directory to the agent's PATH as well as your shell's.
+
+| Agent | Project instructions installed |
+|---|---|
+| ChatGPT Codex (OpenAI) | Managed block in root `AGENTS.md`, or the existing nonempty `AGENTS.override.md` |
+| Claude Code | `.claude/rules/bzlog.md` |
+| Cursor | `.cursor/rules/bzlog.mdc` with `alwaysApply: true` |
+
+No agent rules are written unless both `--agent` and `--project` are supplied.
+Existing instructions outside the marked bzlog block are preserved. Reinstalling
+updates that block without duplication. Conflicting unmanaged files or altered
+Cursor frontmatter produce an error before files are written. Restart the agent
+session to load the rules. Nested overrides, instruction size limits, or disabled
+project rules can affect loading. These are shell workflow instructions, not a
+ChatGPT web-chat plugin; cloud agents need bzlog installed in their own environment.
+
+See [agent setup, sources, and design choices](docs/AGENT_INTEGRATION.md).
+
+## Features in 0.0.1
+
+| Capability | What it provides |
+|---|---|
+| Live and saved BEP analysis | Wrap Bazel or inspect JSON BEP; compact JSON, pretty JSON, and text output |
+| Root-cause diagnostics | Compile/action/analysis/loading/test failures, causal links, grouping by configuration, affected targets, source snippets, suggested repro commands |
+| Evidence on demand | Framework-aware gtest, Go, pytest, Python, and JUnit excerpts; inline, private sidecar, or omitted evidence; `show` retrieval |
+| Correct test outcomes | Final failure, flaky, recovered, and incomplete status; retry/shard/attempt deduplication and cache provenance |
+| Live feedback | Provisional progress and configurable fail-fast cancellation that waits for final test summaries |
+| Test audit and rerun planning | Full execution/cache inventory and conservative label-level rerun previews preserving original flags |
+| Durable bundles | Raw captures and full diagnostic artifacts, SHA-256 deduplication, portable reports, Git observations, integrity verification |
+| Cache metrics | Spawn-cache statistics separated from local action-cache reuse; metrics by exception or `--all-metrics` |
+| Execution-log inspection and comparison | Compact/binary/JSON inputs; cache/runners/mnemonics summaries; changes to inputs, command, environment, platform, outputs, timeout, and cache policy |
+| Stream and wrapper correctness | Completeness reporting, pretty/NDJSON and split UTF-8 reads, stale-file protection, Bazel flags and process exit status preserved |
+| Coding-agent setup | Repeatable installer and shared Bazel guidance for ChatGPT Codex, Claude Code, and Cursor |
+
+The [0.0.1 changelog](CHANGELOG.md) lists the complete shipped scope and known
+limits, including the remote CAS and query/cquery work still outstanding.
+
+## Quick start
+
 Post-hoc:
 
 ```

@@ -80,6 +80,12 @@ unchanged to the native WSL checkout and remains untracked.
     differences guide cache investigation but do not prove lookup misses.
     Reuse Bazel's compact-log reconstruction, and handle its concatenated JSON
     objects rather than assuming newline-delimited records.
+21. **Install the runnable unit and the effective instruction file.** A second
+    Python module makes copying only the original script incomplete. Validate
+    the installed command outside the source directory. Agent rules also have
+    different discovery paths and precedence: Codex may ignore AGENTS.md when
+    an override exists. Keep one shared rule body, preserve unrelated project
+    instructions, and test repeat installs and conflicts before publishing.
 
 The validation record documents alternatives, limitations, and the next work
 in order; it does not treat deferred features as implemented.

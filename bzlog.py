@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 from urllib.parse import urlparse, unquote
 
+__version__ = "0.0.1"
 SCHEMA = "bzlog/v2"
 MAX_EVIDENCE_LINES = 40
 MAX_EVIDENCE_BYTES = 4096
@@ -1795,7 +1796,8 @@ BAZEL_VERBS = {
     "print_action", "query", "run", "shutdown", "sync", "test", "vendor", "version",
 }
 
-_OWN_BOOL = {"--pretty", "--progress", "--all-metrics", "--record-command", "--audit-tests"}
+_OWN_BOOL = {"--pretty", "--progress", "--all-metrics", "--record-command", "--audit-tests",
+             "--version", "--help", "-h"}
 _OWN_VALUE = {"--root", "--fail-fast", "--max-diagnostics", "--format", "--evidence", "--bundle"}
 
 
@@ -2166,8 +2168,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         prog="bzlog",
         description="Compact a Bazel BEP stream for an LLM agent.",
-        epilog="bzlog [flags] <bazel command...>   |   bzlog [flags] <bep.json>",
+        epilog="bzlog [flags] <bazel command...> | bzlog [flags] <bep.json> | "
+               "bzlog {show,rerun,verify,exec-log} --help. "
+               "Put bzlog flags before the Bazel command; use `bzlog -- --help` for Bazel help.",
     )
+    ap.add_argument("--version", action="version", version=f"bzlog {__version__}")
     ap.add_argument("--root", help="workspace root for resolving relative log paths")
     ap.add_argument("--progress", action="store_true",
                     help="emit NDJSON diagnostics to stderr as they occur")

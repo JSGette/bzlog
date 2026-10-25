@@ -1,0 +1,13 @@
+## Bazel diagnostics with bzlog
+
+- When running Bazel builds, tests, or coverage, prefer `bzlog --format text test //target` (substitute the required command and targets). Keep all original Bazel flags and startup options. Put bzlog options first; use `bzlog -- <bazel arguments>` to end its options explicitly.
+- Run bzlog and Bazel in the same workspace and environment. On Windows, use the same WSL distribution for both. If bzlog is unavailable, use Bazel directly and disclose that compact diagnostics were unavailable.
+- Read the final report and process exit code. Wrapper mode preserves Bazel's exit status; post-hoc reports exit zero even for recorded failures. Check `invocation.stream` before treating a report as complete.
+- Diagnose the grouped root causes and affected targets. Retrieve missing detail with `bzlog show SIDECAR EVIDENCE_ID`; excerpts may be distilled or truncated. Missing evidence does not imply matching failures.
+- For an existing JSON BEP, use `bzlog --format text --root WORKSPACE capture.bep.json`. JSON is the default output; use `--pretty` for readable JSON, `--evidence inline` for embedded excerpts, or `--evidence none` to omit them.
+- Use `--progress` for provisional live diagnostics. Use `--fail-fast N` only when early cancellation suits the task; final test summaries decide failure so retries can finish. Distinguish failed, flaky, recovered, and incomplete tests.
+- Use `--audit-tests` to distinguish executed, cached, mixed, not-run, and unknown tests. A passing target or cache hit does not prove every test case ran.
+- For rerun planning, capture JSON with `bzlog --audit-tests --record-command test //... > report.json`, then inspect `bzlog rerun report.json --format text`. This is a label-level preview; check its scope and retained flags before executing it. Do not invent framework-specific filters.
+- Use `--bundle NEW_DIR` when evidence must survive later builds. Inspect the saved report and manifest; `bzlog verify NEW_DIR` checks stored bytes, not test success or complete capture. `bzlog show NEW_DIR EVIDENCE_ID` reads saved excerpts.
+- For cache investigations, use `--all-metrics` or `bzlog exec-log AFTER --baseline BEFORE --converter PATH --format text`. Compact/binary execution logs need Bazel's official converter and its runfiles/JDK; `--input-format json` accepts decoded SpawnExec JSON. Missing spawns can mean local action-cache reuse; changed inputs are clues, not proof of a cache-miss cause.
+- Command recording and full bundles can retain sensitive arguments and logs. Keep them local unless sharing is requested. bzlog does not redact, upload, fetch remote CAS blobs, or perform query/cquery enrichment automatically.
