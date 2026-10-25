@@ -129,6 +129,53 @@ values, and sensitive output even without `--record-command`. Nothing is
 redacted or uploaded automatically. See [bundle format, decisions, and
 limitations](docs/BUNDLES.md) for the exact capture scope and validation.
 
+## Execution-log cache analysis
+
+```sh
+# In a Bazel source checkout, build the official decoder once:
+bazel build //src/tools/execlog:converter
+
+# In the workspace being investigated, capture execution logs:
+bazel build //my:target --execution_log_compact_file=/tmp/after.exec
+
+# Inspect, or compare with a previous capture:
+python3 bzlog.py exec-log /tmp/after.exec \
+  --converter /path/to/bazel/bazel-bin/src/tools/execlog/converter
+python3 bzlog.py exec-log /tmp/after.exec --baseline /tmp/before.exec \
+  --converter /path/to/bazel/bazel-bin/src/tools/execlog/converter --format text
+```
+
+`exec-log` summarizes recorded spawn cache hits, executions without a recorded
+hit, cache eligibility, runners, and mnemonics. Comparisons identify changes to
+arguments, environment names, platform properties, input paths/digests, declared
+outputs, timeout, cache policy, and action digests when available. Reports show
+changed names and paths; argument and environment values are fingerprinted
+internally and are not copied into the report.
+
+Compact and binary logs use Bazel's official converter, which owns zstd/protobuf
+decoding and input/runfiles reconstruction. The converter and its runfiles/JDK
+must remain available; bzlog does not build or download them automatically.
+`--input-format json` directly reads `SpawnExec` JSON without a converter;
+`--input-format binary` accepts the older binary format. Keep
+`bzlog_execlog.py` beside `bzlog.py` when copying the scripts elsewhere.
+
+Matches use target, mnemonic, and first sorted declared output. Duplicate keys
+and records without outputs remain unpaired. Actions absent from either log
+are reported separately: local action-cache reuse can omit them entirely.
+**No cache hit recorded does not prove a remote-cache lookup or miss.** Changed
+fields are investigation clues, not proof of a cache-miss cause or
+non-hermeticity. Execution logs have no terminal completeness marker.
+
+JSON output uses `bzlog/exec-log-v1`. `--max-actions` bounds each detail section
+(default 25), with exact totals and omission counts. JSON records are limited
+to 16 MiB by default (`--max-record-bytes`); conversion has a 120-second per-file
+timeout (`--timeout`). Malformed, truncated, changing, or unsupported input
+returns 2 without a partial report. Valid inspection returns 0 independently
+of the recorded spawn exit codes. Conversion uses private temporary files;
+total conversion disk space and accumulated comparison state are not capped.
+
+See [execution-log decisions and real validation](docs/EXECUTION_LOGS.md).
+
 ## Stream integrity
 
 `invocation.stream` distinguishes `complete`, `incomplete`, `unavailable`, and
@@ -280,11 +327,12 @@ trigger cancellation.
 
 ## Not done yet
 
-- compact exec log (`--execution_log_compact_file`, zstd + `spawn.proto`) for
-  cache-miss analysis
 - `bytestream://` blobs need a CAS fetch to resolve
 - `bazel query`/`cquery` enrichment: map a failing file back to the owning
   target and its reverse deps
+
+The next slices and their tradeoffs are recorded in
+[the execution-log implementation notes](docs/EXECUTION_LOGS.md#remaining-readme-items).
 
 
 ## Output modes

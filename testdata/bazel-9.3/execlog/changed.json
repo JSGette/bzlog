@@ -1,0 +1,70 @@
+{
+  "mnemonic": "CppCompile",
+  "targetLabel": "//src/test/cpp/util:md5_test",
+  "listedOutputs": [
+    "bazel-out/k8-fastbuild/bin/src/test/cpp/util/_objs/md5_test/md5_test.pic.d",
+    "bazel-out/k8-fastbuild/bin/src/test/cpp/util/_objs/md5_test/md5_test.pic.o"
+  ],
+  "runner": "linux-sandbox",
+  "cacheHit": false,
+  "cacheable": true,
+  "remoteCacheable": true,
+  "remotable": true,
+  "digest": {
+    "hash": "1a8b058f22180a4ab3d983b5ff3e4ee1cef53791f60f5ec3a21b66c232949778",
+    "sizeBytes": "146",
+    "hashFunctionName": "SHA-256"
+  },
+  "exitCode": 0,
+  "status": "",
+  "timeoutMillis": "0",
+  "commandArgs": [
+    "-DBZLOG_EXAMPLE=2",
+    "src/test/cpp/util/md5_test.cc"
+  ],
+  "environmentVariables": [
+    {
+      "name": "BZLOG_EXAMPLE",
+      "value": "after"
+    }
+  ],
+  "inputs": [
+    {
+      "path": "src/test/cpp/util/md5_test.cc",
+      "digest": {
+        "hash": "018aba1effeb968d6fd31a74850f3424db331d01ea24af398ec77446d087894c",
+        "sizeBytes": "1715",
+        "hashFunctionName": "SHA-256"
+      },
+      "isTool": false,
+      "symlinkTargetPath": ""
+    }
+  ]
+}{
+  "mnemonic": "CppLink",
+  "targetLabel": "//src/test/cpp/util:md5_test",
+  "listedOutputs": [
+    "bazel-out/k8-fastbuild/bin/src/test/cpp/util/md5_test"
+  ],
+  "runner": "linux-sandbox",
+  "cacheHit": false,
+  "cacheable": true,
+  "remoteCacheable": true,
+  "remotable": true,
+  "digest": {
+    "hash": "a0e6a7605c2cbb8b1679f61ca5756387833ae1b340c9632e8063be4d142d2199",
+    "sizeBytes": "146",
+    "hashFunctionName": "SHA-256"
+  },
+  "exitCode": 0,
+  "status": "",
+  "timeoutMillis": "0",
+  "commandArgs": [],
+  "environmentVariables": [
+    {
+      "name": "BZLOG_EXAMPLE",
+      "value": "after"
+    }
+  ],
+  "inputs": []
+}

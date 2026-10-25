@@ -2152,6 +2152,9 @@ def show_rerun(argv: list[str]) -> int:
 
 def main(argv: Optional[list[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["exec-log"]:
+        from bzlog_execlog import main as exec_log_main
+        return exec_log_main(argv[1:])
     if argv[:1] == ["show"]:
         return show_evidence(argv[1:])
     if argv[:1] == ["rerun"]:

@@ -74,6 +74,12 @@ unchanged to the native WSL checkout and remains untracked.
     shape; protecting only the blobs still permits hangs and false success.
     Resolve relative evidence against the workspace before checking existence,
     and never interpret another host's file URI as a local file.
+20. **Execution-log absence is not an outcome.** Local action-cache reuse omits
+    spawns; a valid execution log can contain none. Pair only unique logical
+    output identities and disclose unmatched/ambiguous records. Recorded input
+    differences guide cache investigation but do not prove lookup misses.
+    Reuse Bazel's compact-log reconstruction, and handle its concatenated JSON
+    objects rather than assuming newline-delimited records.
 
 The validation record documents alternatives, limitations, and the next work
 in order; it does not treat deferred features as implemented.
