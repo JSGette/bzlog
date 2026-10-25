@@ -68,6 +68,12 @@ unchanged to the native WSL checkout and remains untracked.
     path is insufficient. Use BEP references or effective canonical options
     with before/after freshness observations. An option-looking test argument
     must not cause an unrelated file to enter the bundle.
+19. **Apply input checks at every read boundary.** Deferred tool logs need the
+    same malformed-URI handling as immediate diagnostics. Verification must
+    check the manifest itself for regular-file type and validate its collection
+    shape; protecting only the blobs still permits hangs and false success.
+    Resolve relative evidence against the workspace before checking existence,
+    and never interpret another host's file URI as a local file.
 
 The validation record documents alternatives, limitations, and the next work
 in order; it does not treat deferred features as implemented.

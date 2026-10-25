@@ -139,13 +139,18 @@ def _dur_s(d: Any) -> float:
 
 
 def uri_to_path(uri: str) -> Optional[str]:
-    if not uri:
+    if not isinstance(uri, str) or not uri:
         return None
-    if uri.startswith("file://"):
-        return unquote(urlparse(uri).path)
-    if uri.startswith("bytestream://"):
-        return None  # remote-only blob; would need a CAS fetch
-    return uri if os.path.exists(uri) else None
+    if os.path.isabs(uri):
+        return uri
+    try:
+        parsed = urlparse(uri)
+    except ValueError:
+        return None
+    if (parsed.scheme and parsed.scheme != "file") or parsed.netloc not in ("", "localhost"):
+        return None  # Remote references must never fall back to a local path.
+    # Resolve against --root before checking whether a relative path exists.
+    return unquote(parsed.path) if parsed.scheme == "file" else uri
 
 
 def read_file_message(fm: dict[str, Any], root: Optional[str]) -> str:
@@ -1471,7 +1476,10 @@ class InvocationBundle:
         uri = fm.get("uri", "")
         if not isinstance(uri, str) or not uri:
             return self._entry(kind, status="no_reference", **fields)
-        parsed = urlparse(uri)
+        try:
+            parsed = urlparse(uri)
+        except ValueError as exc:
+            return self._entry(kind, status="invalid_uri", source_uri=uri, error=str(exc), **fields)
         if parsed.scheme and parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
             return self._entry(kind, status="remote_only", source_uri=uri, **fields)
         path = unquote(parsed.path) if parsed.scheme == "file" else uri
@@ -1590,20 +1598,30 @@ class InvocationBundle:
 
 
 def verify_bundle(argv: list[str]) -> int:
+    import stat
     ap = argparse.ArgumentParser(prog="bzlog verify", description="Verify the saved bytes in an invocation bundle.")
     ap.add_argument("directory")
     args = ap.parse_args(argv)
-    root, errors, checked = Path(args.directory).resolve(), [], 0
+    errors, checked = [], 0
     manifest = {}
     try:
+        root = Path(args.directory).resolve()
         manifest_path = (root / "manifest.json").resolve()
         if not manifest_path.is_relative_to(root):
             raise ValueError("Manifest path leaves bundle directory.")
-        with manifest_path.open() as fh:
-            manifest = json.load(fh)
+        fd = os.open(manifest_path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as fh:
+            info = os.fstat(fh.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("Manifest is not a regular file.")
+            manifest = json.loads(fh.read(info.st_size))
         if manifest.get("schema") != "bzlog/bundle-v1" or manifest.get("state") != "finalized":
             raise ValueError("Not a finalized bzlog/bundle-v1 manifest.")
+        if not isinstance(manifest.get("artifacts"), list):
+            raise ValueError("Manifest artifacts must be a list.")
         for artifact in manifest["artifacts"]:
+            if not isinstance(artifact, dict):
+                raise ValueError("Each manifest artifact must be an object.")
             if "path" not in artifact:
                 if artifact.get("status") == "saved":
                     errors.append(f"{artifact['id']}: saved artifact has no path")
@@ -1614,7 +1632,6 @@ def verify_bundle(argv: list[str]) -> int:
                 errors.append(f"{artifact['id']}: path leaves bundle directory")
                 continue
             try:
-                import stat
                 digest, size = hashlib.sha256(), 0
                 fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
                 with os.fdopen(fd, "rb") as fh:
@@ -1637,7 +1654,7 @@ def verify_bundle(argv: list[str]) -> int:
                     errors.append(f"{artifact['id']}: size or SHA-256 mismatch")
             except OSError as exc:
                 errors.append(f"{artifact['id']}: {exc}")
-    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError) as exc:
         errors.append(str(exc))
     if not isinstance(manifest, dict):
         manifest = {}

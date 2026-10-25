@@ -66,7 +66,7 @@ and run/shard/attempt associations. The same bytes can serve several references.
 No diagnostic count limit truncates the full-file archive.
 
 Availability statuses include `saved`, `missing`, `remote_only`, `no_reference`,
-`invalid_inline`, `not_regular`, `unreadable`, `write_error`, `copy_error`,
+`invalid_inline`, `invalid_uri`, `not_regular`, `unreadable`, `write_error`, `copy_error`,
 `changed_during_copy`, `not_produced`, `unverified`, and `capture_error`.
 Empty files are saved successfully with zero bytes. Remote URIs are recorded
 without fetching. Regular-file checks avoid reading devices or blocking on

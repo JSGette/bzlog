@@ -99,6 +99,21 @@ class EvidenceTest(unittest.TestCase):
         self.assertEqual(stdout, "excerpt\n")
         self.assertIn("truncated", stderr)
 
+    def test_relative_logs_are_resolved_before_checking_existence(self):
+        log = self.root / "relative log.txt"
+        log.write_text("the actual failure")
+        for uri in (log.name, "file:relative%20log.txt", log.as_uri()):
+            with self.subTest(uri=uri):
+                self.assertEqual(bzlog.read_file_message({"uri": uri}, str(self.root)),
+                                 "the actual failure")
+
+    def test_remote_and_invalid_file_uris_do_not_read_local_files(self):
+        log = self.root / "local.log"
+        log.write_text("unrelated local bytes")
+        for uri in ("file://other-host" + str(log), "file://[invalid", "file:///%00"):
+            with self.subTest(uri=uri):
+                self.assertEqual(bzlog.read_file_message({"uri": uri}, str(self.root)), "")
+
 
 if __name__ == "__main__":
     unittest.main()

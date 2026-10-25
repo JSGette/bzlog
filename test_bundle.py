@@ -214,6 +214,33 @@ class BundleTest(unittest.TestCase):
             code, stdout, _ = self.invoke("verify", str(b.root))
             self.assertEqual(code, 2, stdout)
 
+    def test_verification_requires_an_artifact_list(self):
+        b = self.bundle()
+        b.finalize(bzlog.Container().finish(0))
+        for artifacts in ("", {}, None):
+            manifest = dict(b.manifest, artifacts=artifacts)
+            (b.root / "manifest.json").write_text(json.dumps(manifest))
+            code, stdout, _ = self.invoke("verify", str(b.root))
+            self.assertEqual(code, 2, stdout)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX special files")
+    def test_verification_rejects_fifo_manifest_without_blocking(self):
+        b = self.bundle()
+        (b.root / "manifest.json").unlink()
+        os.mkfifo(b.root / "manifest.json")
+        proc = subprocess.run([sys.executable, bzlog.__file__, "verify", str(b.root)],
+                              capture_output=True, text=True, timeout=3)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["integrity"], "failed")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX symlinks")
+    def test_verification_rejects_symlink_loops_without_traceback(self):
+        b = self.bundle()
+        (b.root / "manifest.json").unlink()
+        (b.root / "manifest.json").symlink_to("manifest.json")
+        code, stdout, _ = self.invoke("verify", str(b.root))
+        self.assertEqual(code, 2, stdout)
+
     @unittest.skipUnless(os.name == "posix", "POSIX symlinks")
     def test_verification_rejects_symlink_escape_and_fifo(self):
         b = self.bundle()
@@ -346,6 +373,22 @@ class BundleWrapperTest(unittest.TestCase):
         self.assertEqual(p.returncode, 127, p.stderr)
         self.assertTrue(report["bundle"]["manifest_saved"])
         self.assertEqual(report["bundle"]["capture_status"], "partial")
+
+    def test_invalid_deferred_reference_preserves_report_and_bazel_exit(self):
+        events = [{"finished": {"exitCode": {"code": 3}}},
+                  {"id": {"buildToolLogs": {}}, "buildToolLogs": {"log": [
+                      {"name": "profile", "uri": "file://[invalid"},
+                      {"name": "valid", "contents": "dmFsaWQ="}]}, "lastMessage": True}]
+        self.fake("path = next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--build_event_json_file='))\n"
+                  f"Path(path).write_text('\\n'.join(json.dumps(e) for e in {events!r}) + '\\n')\n"
+                  "sys.exit(3)\n")
+        p, report = self.run_cli("test", "//tests:one")
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertEqual(report["invocation"]["exit"]["code"], 3)
+        self.assertEqual(report["bundle"]["capture_status"], "partial")
+        manifest = json.loads((self.bundle / "manifest.json").read_text())
+        logs = [a for a in manifest["artifacts"] if a["kind"] == "build_tool_log"]
+        self.assertEqual([a["status"] for a in logs], ["invalid_uri", "saved"])
 
 
 if __name__ == "__main__":
