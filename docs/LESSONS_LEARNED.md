@@ -56,5 +56,18 @@ unchanged to the native WSL checkout and remains untracked.
     bzlog's useful focus is compact headless evidence and explicit uncertainty;
     graphical dependency and performance exploration can use bviz captures.
 
+16. **Archive bytes and associations together.** Keep event IDs and file fields
+    with each full snapshot. Copy each attempt separately even when paths are
+    reused; deduplicate by saved bytes rather than by source path. A stable
+    copy cannot prove that the producer had not already replaced the file.
+17. **Stored-byte integrity is separate from capture coverage.** Hash verification
+    can succeed while evidence is remote-only or the BEP is incomplete. Mark
+    unfinished manifests as collecting and disclose storage failures without
+    replacing Bazel's exit status or hiding usable diagnostic events.
+18. **Companion files need invocation evidence.** A file existing at a requested
+    path is insufficient. Use BEP references or effective canonical options
+    with before/after freshness observations. An option-looking test argument
+    must not cause an unrelated file to enter the bundle.
+
 The validation record documents alternatives, limitations, and the next work
 in order; it does not treat deferred features as implemented.

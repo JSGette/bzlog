@@ -93,6 +93,42 @@ Bazel-side occurrence wins; arguments after `bazel run ... --` belong to the
 program. An existing BEP file is consumed only after the new process changes
 it, so an old failure cannot trigger cancellation of a new invocation.
 
+## Durable invocation bundles
+
+```sh
+python3 bzlog.py --bundle /tmp/build-investigation --audit-tests --record-command \
+  test //... --build_event_binary_file=/tmp/build.bep --profile=/tmp/build.profile.gz
+python3 bzlog.py verify /tmp/build-investigation
+python3 bzlog.py rerun /tmp/build-investigation/report.json --format text
+```
+
+`--bundle NEW_DIR` creates a private directory containing a versioned manifest,
+an inline-evidence `report.json`, `evidence.json`, and full file snapshots named
+by SHA-256. The directory must not already exist. Test logs/XML and action
+stdout/stderr are copied as events arrive; JSON BEP and the full wrapper console
+are retained at completion. BEP-announced tool logs/profiles and freshly written,
+explicitly requested binary BEP/profile/execution-log files are also captured.
+The flag does not enable extra Bazel transports or profiling options.
+
+Files remain available after later builds overwrite their original paths.
+`report.json` and manifest artifact paths remain usable when the bundle moves;
+the recorded replay cwd still refers to the original workspace. `bzlog show
+BUNDLE e1` reads a saved excerpt; full files are listed in the manifest by
+event ID and field. `bzlog verify BUNDLE` checks saved file sizes and hashes.
+Successful verification describes stored-byte integrity, independently of
+BEP completeness, test success, and missing/remote-only evidence.
+
+Post-hoc use also works: `bzlog --bundle NEW_DIR existing.bep.json`. Referenced
+files are captured as they exist now, which may differ from the original run.
+The raw BEP is preserved without rewriting its original file references; use
+the saved report and manifest to inspect the portable snapshots.
+
+Bundles keep full selected evidence regardless of the stdout `--evidence`
+setting. They contain raw BEP and logs, which can include arguments, environment
+values, and sensitive output even without `--record-command`. Nothing is
+redacted or uploaded automatically. See [bundle format, decisions, and
+limitations](docs/BUNDLES.md) for the exact capture scope and validation.
+
 ## Stream integrity
 
 `invocation.stream` distinguishes `complete`, `incomplete`, `unavailable`, and

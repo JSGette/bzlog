@@ -30,6 +30,7 @@ import hashlib
 import argparse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterator, Optional
 from urllib.parse import urlparse, unquote
 
@@ -608,8 +609,10 @@ class StreamStatus:
 
 
 class Container:
-    def __init__(self, root: Optional[str] = None, audit_tests: bool = False):
+    def __init__(self, root: Optional[str] = None, audit_tests: bool = False,
+                 bundle: Optional[InvocationBundle] = None):
         self.root = root
+        self.bundle = bundle
         self.ev = Evidence()
         self.invocation: dict[str, Any] = {}
         self.counts = {
@@ -633,6 +636,12 @@ class Container:
         """Keep a bad event from hiding the rest of the stream, and disclose it."""
         try:
             self.stream.observe(ev)
+            if self.bundle:
+                try:
+                    ev = self.bundle.capture_event(ev, self.root)
+                except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
+                    # Optional archival must not hide a usable event from the report.
+                    self.bundle.manifest["errors"].append(f"event capture: {exc}")
             self.handle(ev)
         except Exception as exc:
             self.stream.skipped_events += 1
@@ -1329,6 +1338,318 @@ def may_add_failure(ev: dict[str, Any]) -> bool:
                                    ("targetSummary", "overallTestStatus"))))
 
 
+_BUNDLE_COMPANIONS = {"build_event_binary_file": "bep_binary", "build_event_text_file": "bep_text",
+                      "profile": "profile", "execution_log_json_file": "execution_log_json",
+                      "execution_log_binary_file": "execution_log_binary",
+                      "execution_log_compact_file": "execution_log_compact", "explain": "explain"}
+
+
+class InvocationBundle:
+    """A new, private directory holding immutable snapshots and a versioned manifest."""
+
+    def __init__(self, directory: str, mode: str):
+        from datetime import datetime, timezone
+        self.root = Path(directory).absolute()
+        self.root.mkdir(mode=0o700)  # Never reuse or overwrite an existing directory.
+        (self.root / "blobs").mkdir(mode=0o700)
+        self.manifest: dict[str, Any] = {
+            "schema": "bzlog/bundle-v1", "state": "collecting", "mode": mode,
+            "created_at": datetime.now(timezone.utc).isoformat(), "capture_cwd": os.getcwd(),
+            "scope": "Selected diagnostic files and raw captures; not a hermetic source/environment archive. "
+                     "Post-hoc file references reflect files available at capture time.",
+            "artifacts": [], "errors": [],
+        }
+        self._event_files: dict[str, dict[str, Any]] = {}
+        self._pending_logs: list[tuple[dict, dict, Optional[str]]] = []
+        self._before: dict[tuple[str, str], Any] = {}
+        self._effective: dict[str, str] = {}
+        self.evidence_saved = False
+        self._write_json("manifest.json", self.manifest)
+        if mode == "live":
+            self._source_state()
+
+    def _source_state(self) -> None:
+        import subprocess
+        try:
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL,
+                                           text=True, timeout=3).strip()
+            dirty = subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=no"],
+                                            stderr=subprocess.DEVNULL, timeout=3)
+            self.manifest["source_state"] = {"git_head": head, "tracked_dirty": bool(dirty),
+                                              "untracked_files_checked": False,
+                                              "observed_at": "before_invocation", "contents_saved": False}
+        except (OSError, subprocess.SubprocessError):
+            self.manifest["source_state"] = {"status": "unavailable"}
+
+    def _write_json(self, name: str, value: Any) -> dict[str, Any]:
+        import tempfile
+        raw = (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        fd, temporary = tempfile.mkstemp(prefix=".writing-", dir=self.root)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(raw)
+            os.replace(temporary, self.root / name)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return {"path": name, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+
+    def _blob(self, source, limit: Optional[int] = None) -> dict[str, Any]:
+        import tempfile
+        fd, temporary = tempfile.mkstemp(prefix=".copying-", dir=self.root)
+        digest, size, suffix = hashlib.sha256(), 0, ""
+        try:
+            with os.fdopen(fd, "wb") as out:
+                while limit is None or size < limit:
+                    chunk = source.read(65536 if limit is None else min(65536, limit - size))
+                    if not chunk:
+                        break
+                    if size == 0 and chunk.startswith(b"\x1f\x8b"):
+                        suffix = ".gz"
+                    digest.update(chunk)
+                    size += len(chunk)
+                    out.write(chunk)
+            relative = "blobs/" + digest.hexdigest() + suffix
+            if not (self.root / relative).exists():
+                os.replace(temporary, self.root / relative)
+            return {"path": relative, "bytes": size, "sha256": digest.hexdigest()}
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _entry(self, kind: str, **fields) -> dict[str, Any]:
+        artifacts = self.manifest["artifacts"]
+        entry = {"id": f"a{len(artifacts) + 1}", "kind": kind, "status": "capture_error", **fields}
+        artifacts.append(entry)
+        return entry
+
+    def capture_stream(self, stream, kind: str, **fields) -> dict[str, Any]:
+        entry = self._entry(kind, **fields)
+        try:
+            entry.update(self._blob(stream), status="saved")
+        except OSError as exc:
+            entry.update(status="write_error", error=str(exc))
+        return entry
+
+    def capture_file(self, filename: str, kind: str, **fields) -> dict[str, Any]:
+        import stat
+        entry = self._entry(kind, source_uri=Path(filename).absolute().as_uri(), **fields)
+        try:
+            # Nonblocking open + fstat avoids hanging on a FIFO or reading a device.
+            fd = os.open(filename, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(fd, "rb") as source:
+                before = os.fstat(source.fileno())
+                if not stat.S_ISREG(before.st_mode):
+                    entry["status"] = "not_regular"
+                    return entry
+                try:
+                    snapshot = self._blob(source, before.st_size)
+                except OSError as exc:
+                    entry.update(status="copy_error", error=str(exc))
+                    return entry
+                after = os.fstat(source.fileno())
+                signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+                stable = (signature(before) == signature(after)
+                          and signature(after) == _file_signature(filename)
+                          and snapshot["bytes"] == after.st_size)
+                entry.update(snapshot, status="saved" if stable else "changed_during_copy")
+        except FileNotFoundError:
+            entry["status"] = "missing"
+        except (OSError, ValueError) as exc:
+            entry.update(status="unreadable", error=str(exc))
+        return entry
+
+    def capture_reference(self, fm: dict, kind: str, root: Optional[str], **fields) -> dict[str, Any]:
+        import base64
+        import io
+        if "contents" in fm:
+            try:
+                raw = base64.b64decode(fm["contents"], validate=True)
+            except (ValueError, TypeError):
+                return self._entry(kind, status="invalid_inline", **fields)
+            return self.capture_stream(io.BytesIO(raw), kind, source="inline", **fields)
+        uri = fm.get("uri", "")
+        if not isinstance(uri, str) or not uri:
+            return self._entry(kind, status="no_reference", **fields)
+        parsed = urlparse(uri)
+        if parsed.scheme and parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+            return self._entry(kind, status="remote_only", source_uri=uri, **fields)
+        path = unquote(parsed.path) if parsed.scheme == "file" else uri
+        if not os.path.isabs(path):
+            path = os.path.join(root or os.getcwd(), path)
+        return self.capture_file(path, kind, **fields)
+
+    def capture_event(self, event: dict[str, Any], root: Optional[str]) -> dict[str, Any]:
+        import copy
+        structured = event.get("structuredCommandLine", {})
+        if structured.get("commandLineLabel") == "canonical":
+            for section in structured.get("sections", []):
+                if section.get("sectionLabel") == "command options":
+                    for option in section.get("optionList", {}).get("option", []):
+                        if option.get("optionName") in _BUNDLE_COMPANIONS:
+                            value = option.get("optionValue", "")
+                            if isinstance(value, str):
+                                self._effective[option["optionName"]] = value
+        if not any(key in event for key in ("action", "testResult", "testSummary", "buildToolLogs")):
+            return event
+        snapshot = copy.deepcopy(event)
+        files: list[tuple[str, str, dict]] = []
+        for name in ("stdout", "stderr"):
+            if name in snapshot.get("action", {}):
+                files.append(("action." + name, "action_" + name, snapshot["action"][name]))
+        for i, fm in enumerate(snapshot.get("testResult", {}).get("testActionOutput", [])):
+            if fm.get("name") in ("test.log", "test.xml"):
+                files.append((f"testResult.testActionOutput[{i}]", fm["name"], fm))
+        for outcome in ("passed", "failed"):
+            for i, fm in enumerate(snapshot.get("testSummary", {}).get(outcome, [])):
+                files.append((f"testSummary.{outcome}[{i}]", "test_summary_log", fm))
+        for i, fm in enumerate(snapshot.get("buildToolLogs", {}).get("log", [])):
+            self._pending_logs.append((fm, {"event_id": event.get("id", {}),
+                                       "field": f"buildToolLogs.log[{i}]", "name": fm.get("name")}, root))
+        for field_name, kind, fm in files:
+            key = json.dumps([event.get("id", {}), field_name], sort_keys=True)
+            if key not in self._event_files:
+                self._event_files[key] = self.capture_reference(
+                    fm, kind, root, event_id=event.get("id", {}), field=field_name,
+                    provenance="bep_reference")
+            entry = self._event_files[key]
+            if entry["status"] == "saved":
+                # Diagnostics and full evidence now use the same immutable bytes.
+                fm.pop("contents", None)
+                fm["uri"] = (self.root / entry["path"]).as_uri()
+        return snapshot
+
+    def prepare_companions(self, argv: list[str]) -> None:
+        # These are only candidate paths until Bazel's canonical metadata
+        # confirms an effective option. A test_arg value can look like a flag.
+        for i, token in enumerate(argv):
+            name, sep, value = token.lstrip("-").partition("=")
+            if token.startswith("--") and name in _BUNDLE_COMPANIONS:
+                if not sep and i + 1 < len(argv):
+                    value = argv[i + 1]
+                if value:
+                    try:
+                        self._before[(name, value)] = _file_signature(value)
+                    except OSError:
+                        self._before[(name, value)] = "unreadable"
+
+    def finish_captures(self) -> None:
+        for fm, fields, root in self._pending_logs:
+            kind = "profile" if fm.get("name") == "command.profile.gz" else "build_tool_log"
+            self.capture_reference(fm, kind, root, provenance="bep_reference", **fields)
+        self._pending_logs.clear()
+        for name, value in self._effective.items():
+            if not value:
+                continue
+            # Profiles and other tool logs can already be associated by BEP.
+            uri = Path(value).absolute().as_uri()
+            if any(a.get("source_uri") == uri for a in self.manifest["artifacts"]):
+                continue
+            before = self._before.get((name, value), "not_observed")
+            try:
+                current = _file_signature(value)
+            except OSError:
+                current = "unreadable"
+            if before in ("not_observed", "unreadable") or current == "unreadable":
+                self._entry(_BUNDLE_COMPANIONS[name], status="unverified", source_uri=uri,
+                            reason="No usable pre-invocation observation of this effective capture path.")
+            elif current is None or current == before:
+                self._entry(_BUNDLE_COMPANIONS[name], status="not_produced", source_uri=uri)
+            else:
+                self.capture_file(value, _BUNDLE_COMPANIONS[name], provenance="effective_option_and_fresh_file")
+
+    def finalize(self, report: dict[str, Any]) -> None:
+        self.finish_captures()
+        self.manifest["invocation"] = {k: report["invocation"][k] for k in
+            ("uuid", "command", "bazel_version", "workspace", "exit", "stream") if k in report["invocation"]}
+        saved_report = dict(report, bundle={"manifest": "manifest.json", "paths_relative_to": "bundle_directory"})
+        for name, value in (("evidence.json", report.get("evidence", {})), ("report.json", saved_report)):
+            try:
+                artifact = self._write_json(name, value)
+                self._entry(name, status="saved", **artifact)
+                if name == "evidence.json":
+                    self.evidence_saved = True
+            except OSError as exc:
+                self.manifest["errors"].append(f"{name}: {exc}")
+        self.manifest["state"] = "finalized"
+        self.manifest["capture_status"] = ("partial" if self.manifest["errors"] or any(
+            a["status"] != "saved" for a in self.manifest["artifacts"]) else "complete")
+        try:
+            self._write_json("manifest.json", self.manifest)
+            persisted = True
+        except OSError as exc:
+            self.manifest["errors"].append(f"manifest.json: {exc}")
+            persisted = False
+        report["bundle"] = {"directory": str(self.root), "manifest": str(self.root / "manifest.json"),
+                            "capture_status": self.manifest["capture_status"] if persisted else "partial",
+                            "manifest_saved": persisted,
+                            "unavailable_artifacts": sum(a["status"] != "saved" for a in self.manifest["artifacts"])}
+        if self.manifest["errors"]:
+            report["bundle"]["errors"] = self.manifest["errors"]
+            print("bzlog: bundle could not be fully saved; see bundle errors", file=sys.stderr)
+
+
+def verify_bundle(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="bzlog verify", description="Verify the saved bytes in an invocation bundle.")
+    ap.add_argument("directory")
+    args = ap.parse_args(argv)
+    root, errors, checked = Path(args.directory).resolve(), [], 0
+    manifest = {}
+    try:
+        manifest_path = (root / "manifest.json").resolve()
+        if not manifest_path.is_relative_to(root):
+            raise ValueError("Manifest path leaves bundle directory.")
+        with manifest_path.open() as fh:
+            manifest = json.load(fh)
+        if manifest.get("schema") != "bzlog/bundle-v1" or manifest.get("state") != "finalized":
+            raise ValueError("Not a finalized bzlog/bundle-v1 manifest.")
+        for artifact in manifest["artifacts"]:
+            if "path" not in artifact:
+                if artifact.get("status") == "saved":
+                    errors.append(f"{artifact['id']}: saved artifact has no path")
+                continue
+            relative = Path(artifact["path"])
+            path = (root / relative).resolve()
+            if relative.is_absolute() or not path.is_relative_to(root):
+                errors.append(f"{artifact['id']}: path leaves bundle directory")
+                continue
+            try:
+                import stat
+                digest, size = hashlib.sha256(), 0
+                fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+                with os.fdopen(fd, "rb") as fh:
+                    info = os.fstat(fh.fileno())
+                    if not stat.S_ISREG(info.st_mode):
+                        errors.append(f"{artifact['id']}: not a regular file")
+                        continue
+                    while size < info.st_size:
+                        chunk = fh.read(min(65536, info.st_size - size))
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        size += len(chunk)
+                    after = os.fstat(fh.fileno())
+                    signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+                    if signature(info) != signature(after) or signature(after) != _file_signature(str(path)):
+                        errors.append(f"{artifact['id']}: file changed during verification")
+                checked += 1
+                if digest.hexdigest() != artifact["sha256"] or size != artifact["bytes"]:
+                    errors.append(f"{artifact['id']}: size or SHA-256 mismatch")
+            except OSError as exc:
+                errors.append(f"{artifact['id']}: {exc}")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        errors.append(str(exc))
+    if not isinstance(manifest, dict):
+        manifest = {}
+    invocation = manifest.get("invocation", {})
+    stream = invocation.get("stream", {}) if isinstance(invocation, dict) else {}
+    print(json.dumps({"schema": "bzlog/verify-v1", "integrity": "failed" if errors else "ok",
+                      "files_checked": checked, "capture_status": manifest.get("capture_status"),
+                      "stream_status": stream.get("status") if isinstance(stream, dict) else None,
+                      "errors": errors}, separators=(",", ":")))
+    return 2 if errors else 0
+
+
 def run_bazel(argv: list[str], c: "Container", emit_progress: bool,
               fail_fast: int) -> tuple[int, int]:
     """Spawn Bazel and consume its event stream live. Returns (exit_code, bep_bytes)."""
@@ -1338,6 +1659,8 @@ def run_bazel(argv: list[str], c: "Container", emit_progress: bool,
     # Respect a BEP path the user already asked for; otherwise use our own.
     cut = argv.index("--") if "--" in argv else len(argv)
     bazel_args = argv[:cut]
+    if c.bundle:
+        c.bundle.prepare_companions(bazel_args)
     user_bep = None
     for i, arg in enumerate(bazel_args):
         if arg.startswith("--build_event_json_file="):
@@ -1370,6 +1693,10 @@ def run_bazel(argv: list[str], c: "Container", emit_progress: bool,
     except OSError as exc:
         console.close()
         c.console_output = f"ERROR: cannot start Bazel: {exc}"
+        if c.bundle:
+            import io
+            c.bundle.capture_stream(io.BytesIO(c.console_output.encode()), "console", provenance="wrapper")
+            c.bundle._entry("bep_json", status="not_produced")
         if ephemeral:
             os.unlink(bep)
         return (127 if isinstance(exc, FileNotFoundError) else 126), 0
@@ -1426,9 +1753,17 @@ def run_bazel(argv: list[str], c: "Container", emit_progress: bool,
                 captured += b"\n[... invocation output omitted ...]\n"
             captured += console.read(32768)
         c.console_output = captured.decode("utf-8", "replace")
+        if c.bundle:
+            console.seek(0)
+            c.bundle.capture_stream(console, "console", provenance="wrapper")
         console.close()
         signature = _file_signature(bep)
         size = signature[2] if signature and signature != previous_signature else 0
+        if c.bundle:
+            if signature and signature != previous_signature:
+                c.bundle.capture_file(bep, "bep_json", provenance="wrapper_fresh_file")
+            else:
+                c.bundle._entry("bep_json", status="not_produced")
         if ephemeral:
             try:
                 os.unlink(bep)
@@ -1444,7 +1779,7 @@ BAZEL_VERBS = {
 }
 
 _OWN_BOOL = {"--pretty", "--progress", "--all-metrics", "--record-command", "--audit-tests"}
-_OWN_VALUE = {"--root", "--fail-fast", "--max-diagnostics", "--format", "--evidence"}
+_OWN_VALUE = {"--root", "--fail-fast", "--max-diagnostics", "--format", "--evidence", "--bundle"}
 
 
 def split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -1563,6 +1898,9 @@ def render_text(result: dict[str, Any]) -> str:
         out.extend("  " + line for line in inv["failure_context"].splitlines())
     if inv.get("replay"):
         out.append(f"replay argv (cwd {inv['replay']['cwd']}): {inv['replay']['command']}")
+    if result.get("bundle"):
+        bundle = result["bundle"]
+        out.append(f"bundle: {bundle['manifest']} ({bundle.get('capture_status', 'see manifest')})")
     if "test_audit" in result:
         audit = result["test_audit"]
         out.append("test audit: " + ", ".join(f"{v} {k}" for k, v in audit["counts"].items()))
@@ -1637,11 +1975,12 @@ def render_text(result: dict[str, Any]) -> str:
 
 def show_evidence(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="bzlog show", description="Read a saved evidence excerpt.")
-    ap.add_argument("sidecar", help="evidence_sidecar path from a bzlog report")
+    ap.add_argument("sidecar", help="evidence_sidecar path from a bzlog report, or a bundle directory")
     ap.add_argument("evidence_id", help="evidence reference, e.g. e1")
     args = ap.parse_args(argv)
     try:
-        with open(args.sidecar) as fh:
+        sidecar = os.path.join(args.sidecar, "evidence.json") if os.path.isdir(args.sidecar) else args.sidecar
+        with open(sidecar) as fh:
             blobs = json.load(fh)
         entry = blobs[args.evidence_id]
         text = entry["text"]
@@ -1800,6 +2139,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return show_evidence(argv[1:])
     if argv[:1] == ["rerun"]:
         return show_rerun(argv[1:])
+    if argv[:1] == ["verify"]:
+        return verify_bundle(argv[1:])
     own, rest = split_argv(argv)
 
     ap = argparse.ArgumentParser(
@@ -1825,6 +2166,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="include original Bazel argv and cwd for replay (may contain secrets)")
     ap.add_argument("--audit-tests", action="store_true",
                     help="include every observed configured test with execution/cache evidence")
+    ap.add_argument("--bundle", metavar="NEW_DIR",
+                    help="save raw captures, full diagnostic files, and a portable report in a new directory")
     args = ap.parse_args(own)
     if args.max_diagnostics < 1:
         ap.error("--max-diagnostics must be at least 1")
@@ -1835,19 +2178,31 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not rest:
         ap.error("need a Bazel command (e.g. `bzlog test //...`) or a BEP file")
 
-    c = Container(root=args.root, audit_tests=args.audit_tests)
+    posthoc = len(rest) == 1 and os.path.isfile(rest[0]) and rest[0] not in BAZEL_VERBS
+    if not posthoc and rest[0] not in BAZEL_VERBS and not rest[0].startswith("-"):
+        print(f"bzlog: '{rest[0]}' is not a Bazel command or an existing file", file=sys.stderr)
+        return 2
+    bundle = None
+    if args.bundle:
+        try:
+            bundle = InvocationBundle(args.bundle, "posthoc" if posthoc else "live")
+        except OSError as exc:
+            print(f"bzlog: cannot create new bundle: {exc}", file=sys.stderr)
+            return 2
+    c = Container(root=args.root, audit_tests=args.audit_tests, bundle=bundle)
     exit_code = 0
 
     # A lone existing file means post-hoc analysis; anything else is a build.
-    if len(rest) == 1 and os.path.isfile(rest[0]) and rest[0] not in BAZEL_VERBS:
-        for ev in iter_events(rest[0], c.stream):
+    if posthoc:
+        source = rest[0]
+        if bundle:
+            entry = bundle.capture_file(source, "bep_json", provenance="posthoc_input")
+            if entry["status"] == "saved":
+                source = str(bundle.root / entry["path"])
+        for ev in iter_events(source, c.stream):
             c.consume(ev)
-        size = os.path.getsize(rest[0])
+        size = os.path.getsize(source)
     else:
-        if rest[0] not in BAZEL_VERBS and not rest[0].startswith("-"):
-            print(f"bzlog: '{rest[0]}' is not a Bazel command or an existing file",
-                  file=sys.stderr)
-            return 2
         if args.record_command:
             import shlex
             replay_argv = ["bazel", *rest]
@@ -1868,6 +2223,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     enrich(result, args.root or c.root)
     if not args.all_metrics:
         prune_metrics(result.get("invocation", {}))
+    if bundle:
+        bundle.finalize(result)
 
     if args.evidence != "inline":
         blobs = result.pop("evidence", {})
@@ -1875,9 +2232,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             import tempfile
             side = None
             try:
-                fd, side = tempfile.mkstemp(prefix="bzlog-evidence-", suffix=".json")
-                with os.fdopen(fd, "w") as fh:
-                    json.dump(blobs, fh)
+                if bundle:
+                    if not bundle.evidence_saved:
+                        raise OSError("bundle evidence file could not be saved")
+                    side = str(bundle.root / "evidence.json")
+                else:
+                    fd, side = tempfile.mkstemp(prefix="bzlog-evidence-", suffix=".json")
+                    with os.fdopen(fd, "w") as fh:
+                        json.dump(blobs, fh)
                 result["evidence_sidecar"] = side
             except OSError as exc:
                 # Never leave dangling references when persistence fails.
