@@ -86,6 +86,26 @@ bzlog test //...
 bzlog --progress --fail-fast 3 coverage //... --combined_report=lcov
 ```
 
+Live text mode emits a heartbeat on stderr once a minute, including while Bazel
+starts or produces no BEP events. Use `--heartbeat=15s` to change the interval,
+`--heartbeat=2m` or `1h` for longer intervals, or `--heartbeat=0` to disable it.
+Plain seconds and decimal durations also work. JSON mode defaults to no
+heartbeat; an explicit `--heartbeat` enables it. Saved BEP analysis never emits
+heartbeats. Put this option before the Bazel command:
+
+```sh
+bzlog --format text --heartbeat=30s build //... >report.txt 2>progress.log
+```
+
+Each line is flushed immediately, so redirected logs and `nohup` runs remain
+observable. Stdout contains only the final report. Heartbeats show elapsed time,
+the latest observed Bazel action progress and running count when available, and
+the latest new diagnostic. Unknown counts appear as `?`. Observed action-event
+and target-completion counts are labeled separately: Bazel may emit only failed
+action events, so their count is not a completed-action total. Heartbeats add no
+Bazel flags. `--progress` still emits diagnostic NDJSON; use `--heartbeat=0` when
+stderr needs to contain only those JSON events.
+
 For replay metadata, add `--record-command` before the Bazel command. It records
 the original argv, a shell-quoted command, and working directory. This is opt-in
 because arguments can contain credentials and lengthy configuration. The

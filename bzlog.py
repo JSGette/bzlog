@@ -28,6 +28,8 @@ import re
 import sys
 import hashlib
 import argparse
+import math
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1702,8 +1704,97 @@ def verify_bundle(argv: list[str]) -> int:
     return 2 if errors else 0
 
 
+def heartbeat_duration(value: str) -> float:
+    """Parse seconds, or a duration with an s/m/h suffix, for argparse."""
+    match = re.fullmatch(r"(\d+(?:\.\d*)?|\.\d+)([smh]?)", value)
+    if match:
+        seconds = float(match[1]) * {"": 1, "s": 1, "m": 60, "h": 3600}[match[2]]
+        if math.isfinite(seconds):
+            return seconds
+    raise argparse.ArgumentTypeError("heartbeat must be a finite nonnegative duration, e.g. 60s, 2m, 1h, or 0")
+
+
+_ANSI_CONTROL = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_ACTION_PROGRESS = re.compile(r"\[\s*(\d[\d,]*)\s*/\s*(\d[\d,]*)\s*\]")
+_RUNNING_PROGRESS = re.compile(r"\b(\d[\d,]*)\s+(?:actions?\s+)?running\b")
+
+
+class BuildHeartbeat:
+    """A deadline checked by the existing single-threaded BEP polling loop."""
+    def __init__(self, interval: float, container: Container):
+        self.interval = interval
+        self.container = container
+        self.started = time.monotonic()
+        self.deadline = self.started + interval
+        self.phase = "waiting for Bazel"
+        self.done = self.total = self.running = None
+        self.action_events = self.target_events = 0
+        self.fragment = ""
+        self.seen_diagnostics = 0
+        self.latest = ""
+
+    def observe(self, event: dict[str, Any]) -> None:
+        if "started" in event:
+            self.phase = "building"
+        self.action_events += isinstance(event.get("action"), dict)
+        self.target_events += isinstance(event.get("completed"), dict)
+        progress = event.get("progress")
+        chunk = progress.get("stderr", "") if isinstance(progress, dict) else ""
+        if isinstance(chunk, str) and chunk:
+            raw = self.fragment + chunk
+            clean = _ANSI_CONTROL.sub("", raw)
+            matches = list(_ACTION_PROGRESS.finditer(clean))
+            if matches:
+                last = matches[-1]
+                numbers = [value.replace(",", "") for value in last.groups()]
+                # Malformed log text must not hit Python's integer digit limit
+                # and abort a build only because heartbeats were enabled.
+                if all(len(value) <= 20 for value in numbers):
+                    self.done, self.total = map(int, numbers)
+                    line = re.split(r"[\r\n]", clean[last.end():], maxsplit=1)[0]
+                    running = _RUNNING_PROGRESS.search(line)
+                    value = running[1].replace(",", "") if running else ""
+                    self.running = int(value) if value and len(value) <= 20 else None
+                    self.phase = "building"
+            elif "Analyzing:" in clean:
+                self.phase = "analyzing"
+            elif "Loading:" in clean:
+                self.phase = "loading"
+            # Retain a partial line (including partial ANSI sequences) across
+            # progress events, but do not keep a growing copy of the build log.
+            self.fragment = re.split(r"[\r\n]", raw)[-1][-4096:]
+        c = self.container
+        if len(c._order) > self.seen_diagnostics:
+            diagnostic = c._diags[c._order[-1]]
+            target = (diagnostic.get("_targets") or [""])[0]
+            message = ((diagnostic.get("errors") or [{}])[0].get("message") or
+                       diagnostic.get("description") or diagnostic.get("failure_message") or
+                       diagnostic.get("reason") or "")
+            self.latest = " ".join(_ANSI_CONTROL.sub("", f"{diagnostic['kind']} {target} {message}").split())[:200]
+            self.seen_diagnostics = len(c._order)
+
+    def tick(self) -> None:
+        if not self.interval:
+            return
+        now = time.monotonic()
+        if now < self.deadline:
+            return
+        self.deadline = now + self.interval
+        elapsed = int(now - self.started)
+        stamp = f"{elapsed // 3600:02d}:{elapsed // 60 % 60:02d}:{elapsed % 60:02d}"
+        progress = (f"last progress: {self.done:,}/{self.total:,} actions, "
+                    f"{self.running if self.running is not None else '?'} running"
+                    if self.done is not None else "actions: ?/?, running: ?")
+        counts = (f"{self.action_events} action events observed "
+                  f"({self.container.counts['actions_failed']} failed), "
+                  f"{self.target_events} target completions observed")
+        latest = f"; latest: {self.latest}" if self.latest else ""
+        print(f"[bzlog {stamp}] {self.phase}: {progress}; {counts}{latest}", file=sys.stderr, flush=True)
+        self.latest = ""
+
+
 def run_bazel(argv: list[str], c: "Container", emit_progress: bool,
-              fail_fast: int) -> tuple[int, int]:
+              fail_fast: int, heartbeat_interval: float = 0) -> tuple[int, int]:
     """Spawn Bazel and consume its event stream live. Returns (exit_code, bep_bytes)."""
     import subprocess
     import tempfile
@@ -1755,9 +1846,20 @@ def run_bazel(argv: list[str], c: "Container", emit_progress: bool,
 
     seen = 0
     killed = False
+    heartbeat = BuildHeartbeat(heartbeat_interval, c) if heartbeat_interval else None
+
+    def is_alive():
+        alive = proc.poll() is None
+        if alive and heartbeat:
+            heartbeat.tick()
+        return alive
+
     try:
-        for ev in tail_events(bep, lambda: proc.poll() is None, c.stream, previous_signature):
+        for ev in tail_events(bep, is_alive, c.stream, previous_signature):
             c.consume(ev)
+            if heartbeat:
+                heartbeat.observe(ev)
+                is_alive()  # Busy streams also need deadline checks.
             if emit_progress and len(c._order) > seen:
                 for fp in c._order[seen:]:
                     d = c._diags[fp]
@@ -1832,7 +1934,7 @@ BAZEL_VERBS = {
 
 _OWN_BOOL = {"--pretty", "--progress", "--all-metrics", "--record-command", "--audit-tests",
              "--version", "--help", "-h"}
-_OWN_VALUE = {"--root", "--fail-fast", "--max-diagnostics", "--format", "--evidence", "--bundle"}
+_OWN_VALUE = {"--root", "--fail-fast", "--max-diagnostics", "--format", "--evidence", "--bundle", "--heartbeat"}
 
 
 def split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -2220,6 +2322,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--root", help="workspace root for resolving relative log paths")
     ap.add_argument("--progress", action="store_true",
                     help="emit NDJSON diagnostics to stderr as they occur")
+    ap.add_argument("--heartbeat", type=heartbeat_duration, metavar="DURATION",
+                    help="periodic stderr status, e.g. 60s or 2m; 0 disables (default: 60s in live text mode, off in JSON)")
     ap.add_argument("--fail-fast", type=int, default=0, metavar="N",
                     help="interrupt the build after N distinct root causes")
     global MAX_DIAGNOSTICS
@@ -2278,7 +2382,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             c.invocation["replay"] = {"argv": replay_argv, "cwd": os.getcwd(),
                                       "command": shlex.join(replay_argv),
                                       "scope": "argv only; environment, rc files and source state are not captured"}
-        exit_code, size = run_bazel(rest, c, args.progress, args.fail_fast)
+        interval = args.heartbeat if args.heartbeat is not None else (60 if args.format == "text" else 0)
+        exit_code, size = run_bazel(rest, c, args.progress, args.fail_fast, interval)
         # subprocess uses -N for signal N; expose the conventional shell status.
         if exit_code < 0:
             exit_code = 128 - exit_code
