@@ -327,7 +327,8 @@ handle the new diagnostic kinds and metric field described below.
 - `invocation` — uuid, command, patterns, exit code, build metrics
 - `summary` — counts only
 - `diagnostics` — normalized failures, deduped by root cause
-- `evidence` — content-addressed blobs, tail-truncated, referenced by id
+- `evidence` — content-addressed blobs referenced by id; bounded log excerpts
+  and complete failed-action command details
 
 Successful actions never appear. Evidence for dropped diagnostics is garbage
 collected before serialization.
@@ -337,6 +338,16 @@ to target-pattern events. Empty analysis events are linked to descriptive root
 causes through BEP child IDs, regardless of event arrival order. Failures with
 unavailable logs are kept separate instead of being assumed identical; matching
 compiler diagnostics are grouped within the same configuration.
+
+Failed actions retain the complete BEP `commandLine` as `command_evidence`
+(`kind: command_line`), encoded as a JSON argv array to preserve argument
+boundaries. Their complete `failureDetail.message` is also saved separately as
+`failure_message_evidence` (`kind: failure_message`), including any working
+directory and environment Bazel reports. When argv is unavailable, the failure
+message remains retrievable without guessing a command from its text. These two
+evidence kinds are not truncated. Text reports identify the primary output and
+provide `bzlog show` commands for both references. Actions with different command
+details or outputs stay separate even when their stderr matches.
 
 When structured messages are missing, bzlog retains bounded BEP progress and
 Bazel console context in the diagnostic message. Bazel `ERROR:` blocks and their
@@ -357,9 +368,10 @@ bzlog show /tmp/bzlog-evidence-EXAMPLE.json e1
 ```
 
 Use the actual path and evidence ID from your report. Sidecars contain bounded
-excerpts, not full original logs, and remain available until removed or cleaned
-up by the system's temporary-file policy. Separate invocations do not overwrite
-each other's evidence. If saving fails, evidence stays inline in the report.
+log excerpts and complete failed-action command details. They remain available
+until removed or cleaned up by the system's temporary-file policy. Separate
+invocations do not overwrite each other's evidence. If saving fails, evidence
+stays inline in the report.
 
 `--evidence inline` includes excerpts in both JSON and text output;
 `--evidence none` omits evidence blobs and references. Diagnostic messages and

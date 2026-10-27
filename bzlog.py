@@ -46,6 +46,7 @@ MAX_EXTRACTED_BYTES = 16384
 MAX_DIAGNOSTICS = 25
 MAX_TEST_ATTEMPTS = 10
 FAILED_TEST_STATUSES = {"FAILED", "TIMEOUT", "REMOTE_FAILURE", "FAILED_TO_BUILD"}
+DIAGNOSTIC_EVIDENCE_FIELDS = ("evidence", "invocation_evidence", "command_evidence", "failure_message_evidence")
 
 
 # --------------------------------------------------------------------------
@@ -563,7 +564,11 @@ class Evidence:
             total_lines: Optional[int] = None) -> Optional[str]:
         if not text.strip():
             return None
-        if kind == "invocation_log":
+        if kind in ("command_line", "failure_message"):
+            # Flags, cwd, and environment can occur anywhere in a failed
+            # action's command. Keep these complete for on-demand retrieval.
+            body, truncated = text, False
+        elif kind == "invocation_log":
             lines = invocation_error_context(text).splitlines()
             if len(lines) > MAX_EVIDENCE_LINES:
                 lines = (lines[:MAX_EVIDENCE_LINES // 2] +
@@ -881,6 +886,9 @@ class Container:
                                "status": diag.get("status"),
                                "failure_category": diag.get("failure_category"),
                                "failure_code": diag.get("failure_code"),
+                               "command_evidence": diag.get("command_evidence"),
+                               "failure_message_evidence": diag.get("failure_message_evidence"),
+                               "primary_output": diag.get("primary_output"),
                                "cases": diag.get("cases")})
         existing = self._diags.get(fp)
         if existing:
@@ -958,8 +966,14 @@ class Container:
                 diag["failure_code"] = (fd.get(cat) or {}).get("code")
                 if fd.get("message"):
                     diag["failure_message"] = fd["message"][:300]
-            if a.get("primaryOutput", {}).get("name"):
-                diag["primary_output"] = a["primaryOutput"]["name"]
+                    diag["failure_message_evidence"] = self.ev.add("failure_message", fd["message"])
+            argv = a.get("commandLine")
+            if isinstance(argv, list) and argv and all(isinstance(arg, str) for arg in argv):
+                diag["command_evidence"] = self.ev.add("command_line", json.dumps(argv, ensure_ascii=False))
+            primary_output = (a.get("primaryOutput", {}).get("name") or
+                              eid.get("actionCompleted", {}).get("primaryOutput"))
+            if primary_output:
+                diag["primary_output"] = primary_output
             if ref:
                 diag["evidence"] = ref
             self.add_diag(diag, label, eid)
@@ -1214,7 +1228,7 @@ class Container:
 
         omitted = max(0, len(resolved) - MAX_DIAGNOSTICS)
         # evidence for dropped diagnostics is dead weight
-        live = {d[key] for d in diags for key in ("evidence", "invocation_evidence") if key in d}
+        live = {d[key] for d in diags for key in DIAGNOSTIC_EVIDENCE_FIELDS if key in d}
         evidence = {k: v for k, v in self.ev.store.items() if k in live}
 
         out = {
@@ -1959,6 +1973,8 @@ def render_text(result: dict[str, Any]) -> str:
         if n:
             tag += f" x{n} targets"
         out.append(tag + f"  {d.get('target','')}")
+        if d.get("primary_output"):
+            out.append(f"  output: {d['primary_output']}")
         if "overall_status" in d:
             note = "" if d.get("final") else " (final summary unavailable)"
             out.append(f"  test status: {d['overall_status']}{note}")
@@ -1992,24 +2008,27 @@ def render_text(result: dict[str, Any]) -> str:
             out.append(f"  category: {category}")
         if d.get("repro"):
             out.append(f"  suggested repro: {d['repro']}")
-        for key in ("evidence", "invocation_evidence"):
+        for key in DIAGNOSTIC_EVIDENCE_FIELDS:
             ref = d.get(key)
             if not ref:
                 continue
-            if key == "invocation_evidence" or (d.get("evidence_scope") == "invocation"
-                                                and d.get("description_scope") != "invocation"):
+            label = ("command" if key == "command_evidence" else
+                     "failure details" if key == "failure_message_evidence" else "log")
+            if key == "invocation_evidence" or (key == "evidence" and
+                                                d.get("evidence_scope") == "invocation" and
+                                                d.get("description_scope") != "invocation"):
                 out.append("  log scope: invocation (not attributed to this target)")
             blob = result.get("evidence", {}).get(ref)
             if blob:
                 if ref in shown_evidence:
-                    out.append(f"  log: {ref} (shown above)")
+                    out.append(f"  {label}: {ref} (shown above)")
                 else:
-                    out.append(f"  log: {ref}")
+                    out.append(f"  {label}: {ref}")
                     out.extend("    " + line for line in blob["text"].splitlines())
                     shown_evidence.add(ref)
             elif result.get("evidence_sidecar"):
                 import shlex
-                out.append(f"  log: bzlog show {shlex.quote(result['evidence_sidecar'])} {ref}")
+                out.append(f"  {label}: bzlog show {shlex.quote(result['evidence_sidecar'])} {ref}")
 
     m = inv.get("metrics")
     if m:
@@ -2302,8 +2321,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                         pass
         for d in result.get("diagnostics", []):
             if args.evidence == "none":
-                d.pop("evidence", None)
-                d.pop("invocation_evidence", None)
+                for key in DIAGNOSTIC_EVIDENCE_FIELDS:
+                    d.pop(key, None)
 
     if args.format == "text":
         print(render_text(result))
