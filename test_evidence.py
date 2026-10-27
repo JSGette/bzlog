@@ -44,6 +44,41 @@ class EvidenceTest(unittest.TestCase):
         self.assertIn("No space left on device", stdout)
         self.assertNotIn("bzlog-show", stdout)
 
+    def test_repository_traceback_remains_retrievable_in_every_evidence_mode(self):
+        context = ("ERROR: /workspace/toolchain.bzl:9:29: repository fetch failed\n"
+                   "Traceback:\nNo space left on device")
+        with self.bep.open("a") as stream:
+            stream.write(json.dumps({"progress": {"stderr": context}}) + "\n")
+        for mode in ("inline", "ref", "none"):
+            with self.subTest(mode=mode):
+                code, stdout, stderr = self.invoke("--evidence", mode, str(self.bep))
+                self.assertEqual(code, 0, stderr)
+                result = json.loads(stdout)
+                diagnostic = result["diagnostics"][0]
+                if mode == "none":
+                    self.assertNotIn("invocation_evidence", diagnostic)
+                elif mode == "ref":
+                    code, excerpt, stderr = self.invoke("show", result["evidence_sidecar"],
+                                                        diagnostic["invocation_evidence"])
+                    self.assertEqual(code, 0, stderr)
+                    self.assertIn(context, excerpt)
+                else:
+                    self.assertEqual(result["evidence"][diagnostic["invocation_evidence"]]["text"], context)
+
+    def test_no_evidence_text_still_recovers_empty_analysis_message(self):
+        self.bep.write_text("\n".join(json.dumps(event) for event in [
+            {"id": {"targetConfigured": {"label": "//a"}},
+             "aborted": {"reason": "ANALYSIS_FAILURE"}},
+            {"progress": {"stderr": "ERROR: /workspace/toolchain.bzl:9:29: fetch failed\n"
+                                      "Traceback:\nNo space left on device"}},
+        ]) + "\n")
+        code, stdout, stderr = self.invoke("--format", "text", "--evidence", "none", str(self.bep))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("No space left on device", stdout)
+        self.assertIn("/workspace/toolchain.bzl:9:29", stdout)
+        self.assertIn("not attributed to this target", stdout)
+        self.assertNotIn("log:", stdout)
+
     def test_evidence_files_are_unique_and_both_remain_readable(self):
         _, first, _ = self.invoke(str(self.bep))
         first = json.loads(first)

@@ -339,9 +339,12 @@ unavailable logs are kept separate instead of being assumed identical; matching
 compiler diagnostics are grouped within the same configuration.
 
 When structured messages are missing, bzlog retains bounded BEP progress and
-Bazel console context. These logs are marked as invocation-wide evidence, not
-attributed to a particular target. Early errors and final output are both kept
-so a long list of skipped-target warnings does not hide the initial failure.
+Bazel console context in the diagnostic message. Bazel `ERROR:` blocks and their
+tracebacks take priority over startup and skipped-target warnings. Recovered
+messages have `description_scope: invocation`; these logs are not attributed to
+a particular target. Analysis diagnostics with their own structured evidence
+also retain an `invocation_evidence` reference for the console traceback. Long
+excerpts preserve both the originating location and terminal failure text.
 
 ## Inspecting evidence
 

@@ -198,6 +198,21 @@ def bounded_log(text: str, nbytes: int = 65536) -> str:
             raw[-half:].decode("utf-8", "ignore"))
 
 
+def invocation_error_context(text: str) -> str:
+    """Prefer Bazel ERROR blocks and their tracebacks over warning fanout."""
+    lines = [line for line in text.splitlines() if not _NOISE.match(line)]
+    errors = []
+    in_error = False
+    for line in lines:
+        if line.startswith("ERROR:"):
+            in_error = True
+        elif line.startswith(("WARNING:", "DEBUG:", "[BEP progress]")):
+            in_error = False
+        if in_error:
+            errors.append(line)
+    return "\n".join(errors or lines).strip()
+
+
 def parse_junit(xml_text: str, limit: int = 10) -> list[dict[str, Any]]:
     """Pull failing cases out of a JUnit test.xml."""
     cases: list[dict[str, Any]] = []
@@ -549,7 +564,7 @@ class Evidence:
         if not text.strip():
             return None
         if kind == "invocation_log":
-            lines = [line for line in text.splitlines() if not _NOISE.match(line)]
+            lines = invocation_error_context(text).splitlines()
             if len(lines) > MAX_EVIDENCE_LINES:
                 lines = (lines[:MAX_EVIDENCE_LINES // 2] +
                          ["[... invocation output omitted ...]"] +
@@ -1168,18 +1183,23 @@ class Container:
         fallback = self._progress_stderr
         if self.console_output and self.console_output != fallback:
             fallback = self.console_output + ("\n[BEP progress]\n" + fallback if fallback else "")
+        context = bounded_log(invocation_error_context(fallback), 2048)
         if fallback and (failed or resolved):
-            lines = [line for line in fallback.splitlines() if not _NOISE.match(line)]
-            start = next((i for i, line in enumerate(lines) if line.startswith("ERROR:")), 0)
-            self.invocation["failure_context"] = bounded_log("\n".join(lines[start:start + 20]), 2048)
+            self.invocation["failure_context"] = context
         for d in resolved:
             if not (d.get("description") or d.get("failure_message") or
                     d.get("errors") or d.get("cases")):
-                d["description"] = (failure.get("message") or
+                d["description"] = (context or failure.get("message") or
                                     f"{d.get('reason', 'Failure')}: no detailed message available.")
+                if context:
+                    d["description_scope"] = "invocation"
             if not d.get("evidence") and fallback:
                 d["evidence"] = self.ev.add("invocation_log", fallback)
                 d["evidence_scope"] = "invocation"
+            elif d.get("kind") == "analysis_error" and fallback:
+                # Bazel may put only a repository exception in Aborted.description
+                # while the originating Starlark traceback is in progress/stderr.
+                d["invocation_evidence"] = self.ev.add("invocation_log", fallback)
         diags = []
         for d in resolved[:MAX_DIAGNOSTICS]:
             targets = d.pop("_targets", [])
@@ -1194,7 +1214,7 @@ class Container:
 
         omitted = max(0, len(resolved) - MAX_DIAGNOSTICS)
         # evidence for dropped diagnostics is dead weight
-        live = {d["evidence"] for d in diags if "evidence" in d}
+        live = {d[key] for d in diags for key in ("evidence", "invocation_evidence") if key in d}
         evidence = {k: v for k, v in self.ev.store.items() if k in live}
 
         out = {
@@ -1953,6 +1973,8 @@ def render_text(result: dict[str, Any]) -> str:
                 out.append(f"    {d['attempts_omitted']} additional attempt(s) omitted")
         message = d.get("description") or d.get("failure_message")
         if message:
+            if d.get("description_scope") == "invocation":
+                out.append("  context scope: invocation (not attributed to this target)")
             out.extend("  " + line for line in message.splitlines())
         for e in d.get("errors", [])[:3]:
             loc = e.get("file", "")
@@ -1970,9 +1992,12 @@ def render_text(result: dict[str, Any]) -> str:
             out.append(f"  category: {category}")
         if d.get("repro"):
             out.append(f"  suggested repro: {d['repro']}")
-        if d.get("evidence"):
-            ref = d["evidence"]
-            if d.get("evidence_scope") == "invocation":
+        for key in ("evidence", "invocation_evidence"):
+            ref = d.get(key)
+            if not ref:
+                continue
+            if key == "invocation_evidence" or (d.get("evidence_scope") == "invocation"
+                                                and d.get("description_scope") != "invocation"):
                 out.append("  log scope: invocation (not attributed to this target)")
             blob = result.get("evidence", {}).get(ref)
             if blob:
@@ -2278,6 +2303,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         for d in result.get("diagnostics", []):
             if args.evidence == "none":
                 d.pop("evidence", None)
+                d.pop("invocation_evidence", None)
 
     if args.format == "text":
         print(render_text(result))
