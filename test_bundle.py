@@ -121,6 +121,26 @@ class BundleTest(unittest.TestCase):
         self.assertTrue(report["evidence"])
         self.assertEqual(report["bundle"]["capture_status"], "partial")
 
+    def test_analysis_invocation_evidence_survives_bundle_and_none_output(self):
+        bep = self.root / "analysis.jsonl"
+        context = "ERROR: /workspace/repo.bzl:2:9: fetch failed\nTraceback:\nNo space left on device"
+        bep.write_text("\n".join(json.dumps(event) for event in [
+            {"id": {"configuredLabel": {"label": "//dep"}},
+             "aborted": {"reason": "ANALYSIS_FAILURE", "description": "RepositoryFunctionException"}},
+            {"progress": {"stderr": context}},
+        ]) + "\n")
+        code, stdout, stderr = self.invoke("--bundle", str(self.destination), "--evidence", "none", str(bep))
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("invocation_evidence", json.loads(stdout)["diagnostics"][0])
+        saved = json.loads((self.destination / "report.json").read_text())
+        ref = saved["diagnostics"][0]["invocation_evidence"]
+        self.assertEqual(saved["evidence"][ref]["text"], context)
+        code, excerpt, stderr = self.invoke("show", str(self.destination), ref)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn(context, excerpt)
+        code, _, stderr = self.invoke("verify", str(self.destination))
+        self.assertEqual(code, 0, stderr)
+
     def test_reused_log_path_preserves_each_attempt_and_diagnostic_snapshot(self):
         b = self.bundle()
         c = bzlog.Container(bundle=b)

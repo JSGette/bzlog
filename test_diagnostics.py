@@ -115,6 +115,71 @@ class DiagnosticTest(unittest.TestCase):
         self.assertIn("No space left on device", text)
         self.assertIn("not attributed to this target", text)
 
+    def test_empty_analysis_recovers_console_traceback_before_warning_fanout(self):
+        traceback = ("ERROR: /workspace/toolchain.bzl:9:29: repository fetch failed\n"
+                     "   Traceback (most recent call last):\n"
+                     "        File \"/workspace/toolchain.bzl\", line 9, column 29\n"
+                     "                ctx.download_and_extract(\n"
+                     "Error in download_and_extract: No space left on device")
+        c = bzlog.Container()
+        c.handle(abort({"targetConfigured": {"label": "//a"}}))
+        c.console_output = ("WARNING: startup warning\n" * 50 + traceback + "\n" +
+                            "WARNING: errors encountered while analyzing target\n" * 53)
+        result = c.finish(0)
+        diagnostic = result["diagnostics"][0]
+        self.assertEqual(diagnostic["description"], traceback)
+        self.assertEqual(diagnostic["description_scope"], "invocation")
+        self.assertEqual(diagnostic["evidence_scope"], "invocation")
+        evidence = result["evidence"][diagnostic["evidence"]]
+        self.assertIn(traceback, evidence["text"])
+        self.assertTrue(evidence["truncated"])
+
+    def test_empty_analysis_uses_progress_traceback_not_generic_failure_detail(self):
+        result = report(abort({"targetConfigured": {"label": "//a"}}),
+                        {"progress": {"stderr": "ERROR: /workspace/toolchain.bzl:9:29: fetch failed\n"}},
+                        {"progress": {"stderr": "Traceback:\nNo space left on device\n"}},
+                        {"finished": {"exitCode": {"code": 1},
+                                      "failureDetail": {"message": "not all targets were analyzed"}}})
+        diagnostic = result["diagnostics"][0]
+        self.assertIn("No space left on device", diagnostic["description"])
+        self.assertIn("/workspace/toolchain.bzl:9:29", diagnostic["description"])
+        self.assertEqual(diagnostic["description_scope"], "invocation")
+
+    def test_explicit_analysis_message_is_not_replaced_by_unrelated_console_error(self):
+        c = bzlog.Container()
+        c.handle(abort({"configuredLabel": {"label": "//a"}}, "visibility violation"))
+        c.console_output = "ERROR: unrelated failure"
+        diagnostic = c.finish(0)["diagnostics"][0]
+        self.assertEqual(diagnostic["description"], "visibility violation")
+        self.assertNotIn("description_scope", diagnostic)
+
+    def test_repository_exception_keeps_direct_and_invocation_evidence(self):
+        description = "RepositoryFunctionException: No space left on device"
+        context = ("ERROR: /workspace/toolchain.bzl:9:29: repository fetch failed\n"
+                   "Traceback:\nNo space left on device")
+        result = report(abort({"configuredLabel": {"label": "//a"}}, description),
+                        {"progress": {"stderr": context}})
+        diagnostic = result["diagnostics"][0]
+        self.assertEqual(diagnostic["description"], description)
+        direct = result["evidence"][diagnostic["evidence"]]
+        invocation = result["evidence"][diagnostic["invocation_evidence"]]
+        self.assertEqual(direct["text"], description)
+        self.assertEqual(invocation["text"], context)
+        self.assertEqual(invocation["kind"], "invocation_log")
+        self.assertIn("not attributed to this target", bzlog.render_text(result))
+
+    def test_long_analysis_traceback_keeps_origin_and_terminal_cause(self):
+        context = ("ERROR: /workspace/toolchain.bzl:9:29: repository fetch failed\n"
+                   "Traceback:\n" + "    nested stack frame\n" * 120 +
+                   "No space left on device\n" + "WARNING: skipped target\n" * 53)
+        result = report(abort({"configuredLabel": {"label": "//a"}}),
+                        {"progress": {"stderr": context}})
+        diagnostic = result["diagnostics"][0]
+        for text in (diagnostic["description"], result["evidence"][diagnostic["evidence"]]["text"]):
+            self.assertIn("/workspace/toolchain.bzl:9:29", text)
+            self.assertIn("No space left on device", text)
+            self.assertIn("omitted", text)
+
     def test_failure_detail_without_action_is_reported(self):
         result = report({"finished": {"exitCode": {"code": 1},
                          "failureDetail": {"message": "repository fetch failed"}}})
